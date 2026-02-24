@@ -27,25 +27,35 @@
 │    (client)     │
 └────────┬────────┘
          │ POST /upload (multipart/form-data)
-         │ Envoie l'image brute
          ▼
-┌─────────────────┐
-│   API Gateway   │  Serveur Go (port 3000)
-│                 │  • Reçoit l'image
-│                 │  • Vérifie le cache Redis
-│                 │  • Stream vers l'optimizer
-│                 │  • Stocke dans Redis + MinIO
-└──┬──────────┬───┘
-   │          │
-   │ io.Pipe  │ PutObject
-   ▼          ▼
-┌──────────┐  ┌─────────────────┐
-│ Optimizer│  │   MinIO         │  Stockage objet (port 9000)
-│(port3001)│  │                 │  • Stockage permanent S3
-│• Resize  │  │  bucket:        │  • Console web (port 9001)
-│• Watermark│ │  "watermarks"   │  • Compatible AWS S3
-│• JPEG    │  └─────────────────┘
-└──────────┘
+┌─────────────────────────────────────────┐
+│            API Gateway (port 3000)      │
+│                                         │
+│  ① Lecture image                        │
+│  ② SHA256                               │
+│  ③ Redis.Get ──► HIT → répond           │
+│  ③ Redis.Get ──► MISS                   │
+│  ④ MinIO.Put(original/)  ← sauvegarde  │
+│  ⑤ Optimizer ──► OK → ⑥Redis ⑦Répond  │
+│  ⑤ Optimizer ──► KO → MinIO.Get retry  │
+└──────┬──────────────────┬───────────────┘
+       │ io.Pipe          │ PutObject / GetObject
+       ▼                  ▼
+┌──────────────┐  ┌──────────────────────┐
+│  Optimizer   │  │        MinIO         │
+│  (port 3001) │  │     (port 9000)      │
+│  • Resize    │  │  bucket: watermarks  │
+│  • Watermark │  │  ├─ original/<hash>  │
+│  • JPEG      │  │  Console: port 9001  │
+└──────────────┘  └──────────────────────┘
+       ▲
+       │ Redis.Get / Redis.Set
+┌──────────────┐
+│    Redis     │
+│  (port 6379) │
+│  Cache RAM   │
+│  TTL : 24h   │
+└──────────────┘
 ```
 
 **Principe clé :** Chaque service est **indépendant** avec son propre `go.mod`. Cela permet de :
@@ -985,106 +995,104 @@ Requête 4 (image A, encore) :
 
 ### 🎯 Le problème
 
-Redis est rapide mais **éphémère** : si le conteneur redémarre (crash, déploiement, panne), toutes les données en RAM sont perdues.
+Si l'optimizer plante en plein traitement, l'image uploadée par le client est **perdue** — il doit tout re-uploader.
 
 ```
 Scénario sans MinIO :
-  Image A traitée → stockée dans Redis
-  Serveur crash → Redis vide
-  Image A re-uploadée → doit retraiter depuis zéro (200ms perdu)
+  Client envoie image → optimizer crash en cours de route
+  → image perdue, client doit ré-uploader
+  → si optimizer reste KO, traitement impossible
 ```
-
-Pour des milliers d'images déjà traitées, **tout le travail de l'optimizer est perdu** à chaque redémarrage.
 
 ---
 
-### ✅ La solution : MinIO comme filet de sécurité
+### ✅ La solution : sauvegarder l'original d'abord
 
 **MinIO** est un serveur de stockage objet **compatible avec l'API Amazon S3**, qui persiste sur disque.
 
-Après une panne, au lieu de re-traiter l'image, l'API récupère le résultat depuis MinIO et **recharge Redis automatiquement** — le processus reprend là où il en était.
+Dès que l'image arrive, elle est sauvegardée dans MinIO **avant** d'être envoyée à l'optimizer. Si l'optimizer plante, l'API récupère l'original depuis MinIO et **réessaie automatiquement**.
 
 ```
 bucket "watermarks"
-├── a3f8c2d1e4b79f3c....jpg   (325 KB)
-├── 063129c3a4ad87ec....jpg   (418 KB)
-└── b7e2f1a0d5c84e9b....jpg   (290 KB)
+└── original/
+    ├── a3f8c2d1e4b79f3c....jpg   (image originale, 2.1 MB)
+    ├── 063129c3a4ad87ec....jpg   (image originale, 3.4 MB)
+    └── b7e2f1a0d5c84e9b....jpg   (image originale, 1.8 MB)
 ```
-
-Chaque objet est nommé avec le **SHA256 de l'image originale** — la même clé que Redis.
 
 ---
 
-### 🔄 Flow complet avec reprise après panne
+### 🔄 Flow complet
 
 ```
-Upload image
-    │
-    ▼ SHA256
-    │
-    ├─► ③ Redis.Get → ✅ HIT  → répond immédiatement (< 1ms)
-    │
-    └─► ③ Redis.Get → ❌ MISS (cache vide ou expiré)
-            │
-            ├─► ④ MinIO.Get → ✅ HIT  → Redis rechargé → répond (~5ms)
-            │                  (reprise après panne : pas besoin de retraiter)
-            │
-            └─► ④ MinIO.Get → ❌ MISS (vraiment jamais traité)
-                    │
-                    ▼ ⑥ Optimizer (200ms)
-                    │
-                    ├─► ⑦ MinIO.Put  (permanent, survit aux pannes)
-                    ├─► ⑧ Redis.Set  (cache chaud, TTL 24h)
-                    └─► ⑨ Répond au client
-```
+① Lecture image
+② SHA256
 
-**Redis = cache L1** (< 1ms, RAM, temporaire)
-**MinIO = cache L2** (~5ms, disque, permanent, reprise après panne)
-**Optimizer = traitement** (200ms, uniquement si les deux manquent)
+③ Redis.Get ──► ✅ HIT  → répond immédiatement (< 1ms)
+
+③ Redis.Get ──► ❌ MISS
+        │
+        ④ MinIO.Put("original/<hash>.jpg")  ← original sauvegardé sur disque
+        │
+        ⑤ Optimizer
+        │
+        ├──► ✅ OK
+        │       ⑥ Redis.Set (TTL 24h)
+        │       ⑦ Répond au client (~200ms)
+        │
+        └──► ❌ KO (crash, timeout)
+                │
+                MinIO.Get("original/<hash>.jpg")  ← récupère l'original
+                │
+                ⑤b Optimizer (2ème tentative)
+                │
+                ├──► ✅ OK → ⑥ Redis.Set → ⑦ Répond
+                └──► ❌ KO → 502 Bad Gateway
+```
 
 ---
 
 ### 💾 Implémentation
 
 ```go
-// Étape 4 : avant l'optimizer, on vérifie MinIO
-obj, err := minioClient.GetObject(ctx, minioBucket, cacheKey+".jpg", minio.GetObjectOptions{})
-if err == nil {
-    minioData, err := io.ReadAll(obj)
-    obj.Close()
-    if err == nil && len(minioData) > 0 {
-        // Reprise après panne : on recharge Redis et on répond
-        redisClient.Set(ctx, cacheKey, minioData, 24*time.Hour)
-        sendResponse(w, r, minioData)
+// Étape 4 : sauvegarder l'original AVANT de traiter
+minioClient.PutObject(ctx, minioBucket, "original/"+cacheKey+".jpg",
+    bytes.NewReader(data), int64(len(data)),
+    minio.PutObjectOptions{ContentType: "image/jpeg"},
+)
+
+// Étape 5 : envoyer à l'optimizer
+result, err := sendToOptimizer(optimizerURL, filename, data)
+if err != nil {
+    // Optimizer KO → récupérer l'original depuis MinIO et réessayer
+    obj, _ := minioClient.GetObject(ctx, minioBucket, "original/"+cacheKey+".jpg", ...)
+    recovered, _ := io.ReadAll(obj)
+    result, err = sendToOptimizer(optimizerURL, filename, recovered)
+    if err != nil {
+        http.Error(w, "Microservice indisponible", 502)
         return
     }
 }
 
-// Étape 6 : seulement si MinIO ne l'a pas non plus
-resp, _ := httpClient.Post(optimizerURL+"/optimize", ...)
-
-// Étape 7 : stocker dans MinIO en premier (persistance)
-minioClient.PutObject(ctx, minioBucket, cacheKey+".jpg", ...)
-
-// Étape 8 : puis dans Redis (cache chaud)
+// Étape 6 : mettre en cache Redis
 redisClient.Set(ctx, cacheKey, result, 24*time.Hour)
 ```
 
 ---
 
-### ⚠️ MinIO.Put est non bloquant
+### ⚠️ Sauvegarde non bloquante
 
-Si MinIO est indisponible au moment du stockage, on ne bloque pas la réponse :
+Si MinIO est indisponible, on continue quand même vers l'optimizer :
 
 ```go
 _, err = minioClient.PutObject(...)
 if err != nil {
-    log.Printf("⚠ Erreur MinIO (non bloquant) : %v", err)
-    // Le client reçoit quand même son image
+    log.Printf("⚠ Sauvegarde original échouée : %v", err)
+    // On continue — pas de sauvegarde, mais le traitement s'effectue quand même
 }
 ```
 
-**Priorité :** Répondre au client > Persister dans MinIO
+**Priorité :** Traiter et répondre > Sauvegarder dans MinIO
 
 ---
 
@@ -1137,7 +1145,7 @@ mc cp local/watermarks/abc123....jpg ./output.jpg
 | Capacité | RAM (limitée) | Disque (grande) |
 | Usage | Cache chaud | Stockage long terme |
 
-**Gain :** Les images traitées ne sont **jamais perdues** même après un reboot, une migration ou une expiration du cache Redis.
+**Gain :** L'image originale est toujours récupérable. Si l'optimizer plante, la **reprise est automatique** sans que le client ait à ré-uploader.
 
 ---
 
