@@ -108,16 +108,30 @@ pr, pw := io.Pipe()
 ### 🔄 Comment ça fonctionne
 
 ```go
-pr, pw := io.Pipe()
+func sendToOptimizer(optimizerURL, filename string, data []byte) ([]byte, error) {
+    pr, pw := io.Pipe()
+    mw := multipart.NewWriter(pw)
 
-// Goroutine 1 : Écrit les données dans le pipe
-go func() {
-    defer pw.Close()
-    io.Copy(pw, file)  // Copie l'image dans le pipe (chunk par chunk)
-}()
+    // Goroutine : écrit dans le pipe pendant que httpClient lit
+    go func() {
+        part, err := mw.CreateFormFile("image", filename)
+        if err != nil {
+            pw.CloseWithError(err)
+            return
+        }
+        io.Copy(part, bytes.NewReader(data))
+        mw.Close()
+        pw.Close()
+    }()
 
-// Goroutine 2 : Lit depuis le pipe et envoie à l'optimizer
-resp, err := httpClient.Post(optimizerURL, contentType, pr)
+    // Lit depuis le pipe et envoie à l'optimizer → zéro copie RAM
+    resp, err := httpClient.Post(optimizerURL+"/optimize", mw.FormDataContentType(), pr)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+    return io.ReadAll(resp.Body)
+}
 ```
 
 **Flux de données :**
@@ -841,42 +855,42 @@ C'est plus que le nombre d'atomes dans l'univers 🤯
 ### 💾 Implémentation du cache
 
 ```go
-import (
-    "crypto/sha256"
-    "encoding/hex"
-    "github.com/redis/go-redis/v9"
-)
-
-var redisClient = redis.NewClient(&redis.Options{
-    Addr: "localhost:6379",
-})
+var redisClient *redis.Client
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
-    file, _, _ := r.FormFile("image")
+    file, header, _ := r.FormFile("image")
     data, _ := io.ReadAll(file)
-    
-    // 1. Calculer le hash de l'image
+
+    // ① Calculer le hash SHA256 de l'image originale
     hash := sha256.Sum256(data)
     cacheKey := hex.EncodeToString(hash[:])
-    
-    // 2. Vérifier si déjà dans le cache
+
+    ctx := context.Background()
+
+    // ② Vérifier le cache Redis
     cached, err := redisClient.Get(ctx, cacheKey).Bytes()
     if err == nil {
-        // ✅ CACHE HIT : L'image a déjà été traitée
-        w.Write(cached)
+        // ✅ CACHE HIT : répondre immédiatement
+        sendResponse(w, r, cached)
         return
     }
-    
-    // ❌ CACHE MISS : 1ère fois qu'on voit cette image
-    
-    // 3. Envoyer à l'optimizer
-    optimized := sendToOptimizer(data)
-    
-    // 4. Stocker dans Redis (expire après 24h)
-    redisClient.Set(ctx, cacheKey, optimized, 24*time.Hour)
-    
-    // 5. Répondre au client
-    w.Write(optimized)
+
+    // ❌ CACHE MISS : sauvegarder l'original dans MinIO, puis traiter
+    originalKey := "original/" + cacheKey + ".jpg"
+    minioClient.PutObject(ctx, minioBucket, originalKey, bytes.NewReader(data), ...)
+
+    result, err := sendToOptimizer(optimizerURL, header.Filename, data)
+    if err != nil {
+        // Optimizer KO → récupérer l'original depuis MinIO et réessayer
+        obj, _ := minioClient.GetObject(ctx, minioBucket, originalKey, ...)
+        recovered, _ := io.ReadAll(obj)
+        result, _ = sendToOptimizer(optimizerURL, header.Filename, recovered)
+    }
+
+    // Mettre en cache Redis (TTL 24h)
+    redisClient.Set(ctx, cacheKey, result, 24*time.Hour)
+
+    sendResponse(w, r, result)
 }
 ```
 
@@ -1052,47 +1066,138 @@ bucket "watermarks"
 
 ---
 
-### 💾 Implémentation
+### 💾 Initialisation dans `main()`
 
 ```go
-// Étape 4 : sauvegarder l'original AVANT de traiter
-minioClient.PutObject(ctx, minioBucket, "original/"+cacheKey+".jpg",
+const minioBucket = "watermarks"
+
+var minioClient *minio.Client
+
+// Connexion MinIO depuis les variables d'environnement
+minioEndpoint := os.Getenv("MINIO_ENDPOINT")   // ex: "minio:9000"
+minioUser     := os.Getenv("MINIO_ROOT_USER")  // ex: "minioadmin"
+minioPassword := os.Getenv("MINIO_ROOT_PASSWORD")
+
+minioClient, err = minio.New(minioEndpoint, &minio.Options{
+    Creds:  credentials.NewStaticV4(minioUser, minioPassword, ""),
+    Secure: false,
+})
+
+// Création du bucket s'il n'existe pas encore
+exists, _ := minioClient.BucketExists(ctx, minioBucket)
+if !exists {
+    minioClient.MakeBucket(ctx, minioBucket, minio.MakeBucketOptions{})
+}
+```
+
+---
+
+### 💾 Implémentation dans `handleUpload()`
+
+```go
+// ── Étape 4 : Sauvegarde original dans MinIO ─────────
+originalKey := "original/" + cacheKey + ".jpg"
+_, err = minioClient.PutObject(ctx, minioBucket, originalKey,
     bytes.NewReader(data), int64(len(data)),
     minio.PutObjectOptions{ContentType: "image/jpeg"},
 )
-
-// Étape 5 : envoyer à l'optimizer
-result, err := sendToOptimizer(optimizerURL, filename, data)
 if err != nil {
-    // Optimizer KO → récupérer l'original depuis MinIO et réessayer
-    obj, _ := minioClient.GetObject(ctx, minioBucket, "original/"+cacheKey+".jpg", ...)
-    recovered, _ := io.ReadAll(obj)
-    result, err = sendToOptimizer(optimizerURL, filename, recovered)
+    log.Printf("[API] ④ MinIO.Put  : ⚠ Sauvegarde original échouée : %v", err)
+    // Non bloquant : on continue vers l'optimizer quand même
+} else {
+    log.Printf("[API] ④ MinIO.Put  : ✓ Original sauvegardé | %s", formatBytes(len(data)))
+}
+
+// ── Étape 5 : Forward vers l'optimizer ───────────────
+result, err := sendToOptimizer(optimizerURL, header.Filename, data)
+if err != nil {
+    // ── Étape 5b : Optimizer KO → reprise depuis MinIO ───
+    log.Printf("[API] ⑤ Optimizer  : ❌ %v → reprise depuis MinIO", err)
+
+    obj, merr := minioClient.GetObject(ctx, minioBucket, originalKey, minio.GetObjectOptions{})
+    if merr != nil {
+        http.Error(w, "Microservice indisponible", http.StatusBadGateway)
+        return
+    }
+    recovered, merr := io.ReadAll(obj)
+    obj.Close()
+    if merr != nil || len(recovered) == 0 {
+        http.Error(w, "Microservice indisponible", http.StatusBadGateway)
+        return
+    }
+
+    log.Printf("[API] ⑤ MinIO.Get  : ✅ Original récupéré → 2ème tentative optimizer")
+    result, err = sendToOptimizer(optimizerURL, header.Filename, recovered)
     if err != nil {
-        http.Error(w, "Microservice indisponible", 502)
+        http.Error(w, "Microservice indisponible", http.StatusBadGateway)
         return
     }
 }
 
-// Étape 6 : mettre en cache Redis
+// ── Étape 6 : Stockage Redis ──────────────────────────
 redisClient.Set(ctx, cacheKey, result, 24*time.Hour)
 ```
 
 ---
 
-### ⚠️ Sauvegarde non bloquante
+### 🔁 Fonction `sendToOptimizer()`
 
-Si MinIO est indisponible, on continue quand même vers l'optimizer :
+Extraite pour pouvoir être appelée deux fois (1ère tentative + reprise depuis MinIO) :
 
 ```go
-_, err = minioClient.PutObject(...)
-if err != nil {
-    log.Printf("⚠ Sauvegarde original échouée : %v", err)
-    // On continue — pas de sauvegarde, mais le traitement s'effectue quand même
+func sendToOptimizer(optimizerURL, filename string, data []byte) ([]byte, error) {
+    pr, pw := io.Pipe()
+    mw := multipart.NewWriter(pw)
+
+    go func() {
+        part, err := mw.CreateFormFile("image", filename)
+        if err != nil {
+            pw.CloseWithError(err)
+            return
+        }
+        io.Copy(part, bytes.NewReader(data))
+        mw.Close()
+        pw.Close()
+    }()
+
+    resp, err := httpClient.Post(optimizerURL+"/optimize", mw.FormDataContentType(), pr)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    return io.ReadAll(resp.Body)
 }
 ```
 
-**Priorité :** Traiter et répondre > Sauvegarder dans MinIO
+---
+
+### 🖼️ Endpoint `GET /image/{hash}`
+
+Permet de vérifier qu'une image originale est bien stockée dans MinIO :
+
+```go
+func handleGetImage(w http.ResponseWriter, r *http.Request) {
+    hash := r.PathValue("hash")
+    objectName := hash + ".jpg"
+
+    obj, err := minioClient.GetObject(r.Context(), minioBucket, objectName, minio.GetObjectOptions{})
+    if err != nil {
+        http.Error(w, "Objet introuvable", http.StatusNotFound)
+        return
+    }
+    defer obj.Close()
+
+    info, _ := obj.Stat()
+    w.Header().Set("Content-Type", "image/jpeg")
+    w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size))
+    io.Copy(w, obj)
+}
+```
+
+```
+GET http://localhost:3000/image/<hash>
+```
 
 ---
 
