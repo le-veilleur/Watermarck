@@ -1,0 +1,5 @@
+node_modules/
+api/api
+optimizer/optimizer
+*.exe
+.env
