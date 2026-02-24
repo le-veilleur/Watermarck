@@ -74,7 +74,9 @@ export default function App() {
           const { status, url } = await res.json()
           if (status === 'done') {
             clearInterval(interval)
-            const imgRes = await fetch(`http://localhost:3000${url}`)
+            const imgRes = await fetch(`http://localhost:3000${url}`, {
+              headers: { Accept: 'image/webp,image/jpeg,*/*' },
+            })
             const blob = await imgRes.blob()
             const elapsed = Math.round(performance.now() - t0)
             setResult(URL.createObjectURL(blob))
@@ -111,6 +113,7 @@ export default function App() {
     try {
       const res = await fetch('http://localhost:3000/upload', {
         method: 'POST',
+        headers: { Accept: 'image/webp,image/jpeg,*/*' },
         body: formData,
       })
 
