@@ -8,7 +8,7 @@
 | Document | Contenu |
 |----------|---------|
 | [📄 REDIS.md](./REDIS.md) | Structures de données, cache, Pub/Sub, persistance, Cluster |
-| [📄 RABBITMQ.md](./RABBITMQ.md) | Exchanges, Queues, ACK, DLQ, Publisher Confirms |
+| [📄 RABBITMQ.md](./RABBITMQ.md) | Exchanges, Queues, ACK, DLQ, Publisher Confirms, Option B implémentée |
 
 ---
 
@@ -36,27 +36,34 @@
 │    (client)     │
 └────────┬────────┘
          │ POST /upload (multipart/form-data)
+         │ GET  /status/{hash}  ← polling (si 202)
+         │ GET  /image/{hash}   ← récupère résultat
          ▼
-┌─────────────────────────────────────────┐
-│            API Gateway (port 3000)      │
-│                                         │
-│  ① Lecture image                        │
-│  ② SHA256                               │
-│  ③ Redis.Get ──► HIT → répond           │
-│  ③ Redis.Get ──► MISS                   │
-│  ④ MinIO.Put(original/)  ← sauvegarde  │
-│  ⑤ Optimizer ──► OK → ⑥Redis ⑦Répond  │
-│  ⑤ Optimizer ──► KO → MinIO.Get retry  │
-└──────┬──────────────────┬───────────────┘
-       │ io.Pipe          │ PutObject / GetObject
-       ▼                  ▼
-┌──────────────┐  ┌──────────────────────┐
-│  Optimizer   │  │        MinIO         │
-│  (port 3001) │  │     (port 9000)      │
-│  • Resize    │  │  bucket: watermarks  │
-│  • Watermark │  │  ├─ original/<hash>  │
-│  • JPEG      │  │  Console: port 9001  │
-└──────────────┘  └──────────────────────┘
+┌────────────────────────────────────────────────┐
+│              API Gateway (port 3000)           │
+│                                                │
+│  ① Lecture image                               │
+│  ② SHA256                                      │
+│  ③ Redis.Get ──► HIT → 200 + image             │
+│  ③ Redis.Get ──► MISS                          │
+│  ④ MinIO.Put(original/<hash>.jpg)              │
+│  ⑤ HTTP → Optimizer ──► OK → Redis → 200      │
+│  ⑤ HTTP → Optimizer ──► KO                    │
+│          └─► Publish job → RabbitMQ → 202     │
+│                                                │
+│  [Worker goroutine] ← Consume RabbitMQ        │
+│    MinIO.Get(original) → Optimizer → Redis    │
+└──────┬────────────┬────────────┬───────────────┘
+       │ io.Pipe    │ PutObject  │ Publish/Consume
+       ▼            ▼            ▼
+┌──────────┐ ┌──────────────┐ ┌─────────────────┐
+│Optimizer │ │    MinIO     │ │    RabbitMQ     │
+│port 3001 │ │  port 9000   │ │   port 5672     │
+│• Resize  │ │  watermarks/ │ │ watermark_retry │
+│• Watermark│ │  original/   │ │  (durable)      │
+│• JPEG    │ │  Console:9001│ │  Management:    │
+└──────────┘ └──────────────┘ │   port 15672    │
+                               └─────────────────┘
        ▲
        │ Redis.Get / Redis.Set
 ┌──────────────┐
@@ -65,6 +72,18 @@
 │  Cache RAM   │
 │  TTL : 24h   │
 └──────────────┘
+```
+
+**Flow nominal (optimizer disponible) :**
+```
+POST /upload → MinIO.Put(original) → HTTP optimizer → Redis.Set → 200 + image
+```
+
+**Flow fallback RabbitMQ (optimizer KO) :**
+```
+POST /upload → MinIO.Put(original) → HTTP optimizer (erreur) → RabbitMQ.Publish → 202 + jobId
+[Worker]     → RabbitMQ.Consume → MinIO.Get(original) → HTTP optimizer → Redis.Set → ACK
+GET /status/{hash} → Redis.Exists → "done" → GET /image/{hash} → Redis.Get → image
 ```
 
 **Principe clé :** Chaque service est **indépendant** avec son propre `go.mod`. Cela permet de :
@@ -1065,12 +1084,18 @@ bucket "watermarks"
         │
         └──► ❌ KO (crash, timeout)
                 │
+                RabbitMQ.Publish(job) ← job durable publié
+                │
+                202 Accepted {"jobId": hash}
+                │
+                [Worker goroutine consomme la queue]
+                │
                 MinIO.Get("original/<hash>.jpg")  ← récupère l'original
                 │
-                ⑤b Optimizer (2ème tentative)
+                ⑤b Optimizer (retry par le worker)
                 │
-                ├──► ✅ OK → ⑥ Redis.Set → ⑦ Répond
-                └──► ❌ KO → 502 Bad Gateway
+                ├──► ✅ OK → Redis.Set → ACK
+                └──► ❌ KO → NACK (requeue, retry dans 10s)
 ```
 
 ---

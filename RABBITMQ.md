@@ -16,6 +16,7 @@
 9. [Durabilité et persistance](#durabilite)
 10. [Prefetch et QoS — Contrôle de charge](#prefetch)
 11. [Résumé et cas d'usage](#résumé)
+12. [Implémentation dans NWS Watermark — Option B](#implementation)
 
 ---
 
@@ -835,6 +836,359 @@ Sans `ch.Qos()`, un consommateur lent peut recevoir tous les messages et les blo
 
 #### 5. **DLQ = filet de sécurité**
 Les messages qui échouent répétitivement doivent aller en DLQ pour analyse, pas boucler indéfiniment.
+
+---
+
+<a name="implementation"></a>
+## 12. Implémentation dans NWS Watermark — Option B
+
+### 🎯 Le problème
+
+L'optimizer est un microservice HTTP qui peut être temporairement indisponible (déploiement, crash, surcharge). Dans ce cas, l'image uploadée ne doit pas être perdue et le traitement doit reprendre automatiquement dès que le service est rétabli.
+
+---
+
+### 🏗️ Choix architectural : Option B (HTTP sync + RabbitMQ fallback)
+
+Deux architectures étaient possibles :
+
+| | Option A | Option B ✅ |
+|---|---|---|
+| Canal principal | RabbitMQ (toujours async) | HTTP direct (synchrone) |
+| Canal fallback | — | RabbitMQ (si optimizer KO) |
+| Réponse au client | Toujours 202 + polling | 200 direct si OK, 202 si KO |
+| Complexité front | Haute (polling systématique) | Faible (polling seulement si erreur) |
+| Usage RabbitMQ | Principal | Filet de sécurité |
+
+**Option B** est choisie car : le comportement nominal reste simple et rapide (200 direct), RabbitMQ n'intervient que sur panne, la complexité est proportionnelle au besoin réel.
+
+---
+
+### 🔄 Flow complet
+
+#### Chemin nominal (optimizer disponible)
+
+```
+Front                   API                   Optimizer            Redis           MinIO
+  │                      │                       │                   │               │
+  │──POST /upload ───────►│                       │                   │               │
+  │                      │ SHA256                │                   │               │
+  │                      │──────────────────────────────────────────────────────────►│ PUT original
+  │                      │──── HTTP POST /optimize ──────────────────►│               │
+  │                      │◄─────────── image watermarkée ─────────────│               │
+  │                      │────────────────────────────────────────────►│ Redis.Set     │
+  │◄─── 200 + image ──────│                       │                   │               │
+```
+
+#### Chemin fallback (optimizer KO)
+
+```
+Front                   API                RabbitMQ          Worker             Redis           MinIO
+  │                      │                    │                 │                 │               │
+  │──POST /upload ───────►│                   │                 │                 │               │
+  │                      │──── HTTP (erreur) ─►                 │                 │               │
+  │                      │──── Publish job ───►│                 │                 │               │
+  │◄─── 202 {"jobId"} ────│                   │                 │                 │               │
+  │                      │                   │── Deliver job ──►│                 │               │
+  │─── GET /status ───────►│                   │                 │──── MinIO.Get ──────────────────►│
+  │◄─── {pending} ─────────│                   │                 │◄─── original ───────────────────│
+  │                       │                   │                 │──── HTTP optimizer ─►            │
+  │  (optimizer revient)  │                   │                 │◄─── image ──────────             │
+  │                       │                   │                 │──── Redis.Set ───────────────────►│
+  │                       │                   │                 │──── ACK ──────────►│              │
+  │─── GET /status ───────►│                   │                 │                   │              │
+  │◄─── {done, url} ───────│                   │                 │                   │              │
+  │─── GET /image/{hash} ─►│                   │                 │                   │              │
+  │◄─── image ─────────────│◄────────────────────────────────────────── Redis.Get ──►│              │
+```
+
+---
+
+### ⚙️ Initialisation RabbitMQ dans `main()`
+
+```go
+// L'URL est injectée par Docker Compose via RABBITMQ_URL
+rabbitmqURL := os.Getenv("RABBITMQ_URL")
+if rabbitmqURL == "" {
+    rabbitmqURL = "amqp://guest:guest@localhost:5672/"
+}
+
+// Connexion TCP + authentification
+amqpConn, _ := amqp.Dial(rabbitmqURL)
+
+// Un channel = connexion virtuelle multiplexée (légère à créer)
+amqpChan, _ = amqpConn.Channel()
+
+// Déclaration de la queue durable
+// durable=true : la queue survit aux redémarrages de RabbitMQ
+// auto-delete=false : la queue persiste même sans consommateur actif
+amqpChan.QueueDeclare(
+    "watermark_retry",
+    true,  // durable
+    false, // auto-delete
+    false, // exclusive
+    false, // no-wait
+    nil,
+)
+
+// Lancement du worker en arrière-plan
+go retryWorker()
+```
+
+---
+
+### 📨 Publication dans `handleUpload()` (fallback)
+
+```go
+// RetryJob : données nécessaires pour retrouver l'image et la retraiter
+type RetryJob struct {
+    Hash        string `json:"hash"`         // clé Redis / SHA256 de l'image
+    OriginalKey string `json:"original_key"` // chemin dans MinIO : "original/<hash>.jpg"
+    Filename    string `json:"filename"`     // nom original du fichier
+}
+
+// Dans handleUpload, si l'optimizer est KO :
+result, err := sendToOptimizer(optimizerURL, header.Filename, data)
+if err != nil {
+    job := RetryJob{
+        Hash:        cacheKey,
+        OriginalKey: "original/" + cacheKey + ".jpg",
+        Filename:    header.Filename,
+    }
+    body, _ := json.Marshal(job)
+
+    amqpChan.PublishWithContext(ctx,
+        "",                // exchange vide = exchange par défaut
+        "watermark_retry", // routing key = nom de la queue (direct)
+        false, false,
+        amqp.Publishing{
+            DeliveryMode: amqp.Persistent, // message écrit sur disque dans RabbitMQ
+            ContentType:  "application/json",
+            Body:         body,
+        },
+    )
+
+    // 202 Accepted : le traitement se fera plus tard
+    w.WriteHeader(http.StatusAccepted)
+    json.NewEncoder(w).Encode(map[string]string{"jobId": cacheKey})
+    return
+}
+```
+
+**Pourquoi `DeliveryMode: Persistent` ?** Si RabbitMQ redémarre entre la publication et la consommation, le message est relu depuis le disque. Sans ce flag, il serait perdu.
+
+**Pourquoi l'exchange vide `""` ?** L'exchange par défaut de RabbitMQ route directement vers la queue dont le nom correspond à la routing key. C'est le pattern le plus simple pour un cas point-à-point.
+
+---
+
+### 🔍 Endpoint `/status/{hash}` (polling)
+
+```go
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+    hash := r.PathValue("hash")
+    ctx  := context.Background()
+
+    // Redis.Exists retourne 1 si la clé existe, 0 sinon
+    exists, _ := redisClient.Exists(ctx, hash).Result()
+
+    w.Header().Set("Content-Type", "application/json")
+    if exists == 1 {
+        // Le retryWorker a terminé : le résultat est dans Redis
+        json.NewEncoder(w).Encode(map[string]string{
+            "status": "done",
+            "url":    "/image/" + hash,
+        })
+    } else {
+        // Le worker traite encore (ou attend que l'optimizer revienne)
+        json.NewEncoder(w).Encode(map[string]string{"status": "pending"})
+    }
+}
+```
+
+---
+
+### 🔁 Worker `retryWorker()`
+
+```go
+func retryWorker() {
+    // Prefetch 1 : ne recevoir qu'un message à la fois
+    // → garantit qu'un message non-ACKé sera re-délivré si le worker crash
+    amqpChan.Qos(1, 0, false)
+
+    msgs, _ := amqpChan.Consume(
+        "watermark_retry",
+        "",    // consumer tag auto-généré
+        false, // auto-ack=false → ACK manuel obligatoire
+        false, false, false, nil,
+    )
+
+    for msg := range msgs {
+        var job RetryJob
+        if err := json.Unmarshal(msg.Body, &job); err != nil {
+            // Poison pill : message invalide, on l'élimine définitivement
+            msg.Ack(false)
+            continue
+        }
+
+        // ① Récupérer l'original depuis MinIO
+        ctx := context.Background()
+        obj, err := minioClient.GetObject(ctx, minioBucket, job.OriginalKey, minio.GetObjectOptions{})
+        if err != nil {
+            msg.Nack(false, true) // requeue=true : sera re-délivré
+            time.Sleep(5 * time.Second)
+            continue
+        }
+        data, _ := io.ReadAll(obj)
+        obj.Close()
+
+        // ② Retenter l'optimizer
+        result, err := sendToOptimizer(optimizerURL, job.Filename, data)
+        if err != nil {
+            msg.Nack(false, true) // requeue : l'optimizer est toujours KO
+            time.Sleep(10 * time.Second)
+            continue
+        }
+
+        // ③ Stocker dans Redis (même clé que le chemin nominal)
+        redisClient.Set(ctx, job.Hash, result, 24*time.Hour)
+
+        // ④ ACK : message traité avec succès, retiré de la queue
+        msg.Ack(false)
+    }
+}
+```
+
+**Cycle de vie d'un message dans le worker :**
+
+```
+RabbitMQ deliver ──► json.Unmarshal
+                          │
+                    ┌─────▼─────┐
+                    │MinIO.Get  │ erreur → NACK (requeue) + sleep 5s
+                    └─────┬─────┘
+                          │ OK
+                    ┌─────▼──────────┐
+                    │sendToOptimizer │ erreur → NACK (requeue) + sleep 10s
+                    └─────┬──────────┘
+                          │ OK
+                    ┌─────▼──────┐
+                    │Redis.Set   │
+                    └─────┬──────┘
+                          │
+                      Ack(false) → message supprimé de la queue ✅
+```
+
+**Pourquoi `sleep` avant de NACK ?** Sans délai, le message est immédiatement re-délivré → boucle active qui consomme du CPU inutilement. Le sleep laisse le temps à l'optimizer de redémarrer.
+
+---
+
+### 🖥️ Polling côté front-end (App.jsx)
+
+```jsx
+const handleUpload = async () => {
+  const res = await fetch('http://localhost:3000/upload', {
+    method: 'POST', body: formData,
+  })
+
+  // Chemin nominal (200) : image directement dans la réponse
+  if (res.status === 200) {
+    const blob = await res.blob()
+    const cached = res.headers.get('X-Cache') === 'HIT'
+    setResult(URL.createObjectURL(blob))
+    setStats({ ...stats, cached })
+    return
+  }
+
+  // Fallback RabbitMQ (202) : polling jusqu'à ce que le worker finisse
+  if (res.status === 202) {
+    const { jobId } = await res.json()
+    await pollStatus(jobId, file, t0)
+  }
+}
+
+const pollStatus = (jobId, file, t0) =>
+  new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      const { status, url } = await fetch(`/status/${jobId}`).then(r => r.json())
+
+      if (status === 'done') {
+        clearInterval(interval)
+        const blob = await fetch(`http://localhost:3000${url}`).then(r => r.blob())
+        setResult(URL.createObjectURL(blob))
+        setStats({ elapsed: Math.round(performance.now() - t0), retried: true, ... })
+        resolve()
+      }
+    }, 500) // interroge toutes les 500ms
+  })
+```
+
+**Badge `🐇 rabbit`** dans les stats : affiché quand `stats.retried === true`, pour indiquer que le résultat vient du fallback RabbitMQ.
+
+---
+
+### 🐳 Configuration Docker Compose
+
+```yaml
+rabbitmq:
+  image: rabbitmq:3-management-alpine
+  ports:
+    - "5672:5672"    # AMQP (protocole messagerie)
+    - "15672:15672"  # Management UI
+  environment:
+    - RABBITMQ_DEFAULT_USER=guest
+    - RABBITMQ_DEFAULT_PASS=guest
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "ping"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+
+api:
+  environment:
+    - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+  depends_on:
+    - rabbitmq
+```
+
+**Management UI** : `http://localhost:15672` — visualiser en temps réel la queue `watermark_retry`, les messages en attente, les ACK/NACK.
+
+---
+
+### 🧪 Tester le fallback
+
+```bash
+# 1. Lancer tous les services
+docker compose up
+
+# 2. Uploader une image (chemin nominal → 200)
+curl -F "image=@photo.jpg" http://localhost:3000/upload
+
+# 3. Arrêter l'optimizer pour simuler une panne
+docker compose stop optimizer
+
+# 4. Uploader une image (fallback → 202 + job dans RabbitMQ)
+# Le front affiche "Traitement..." et poll /status/{hash}
+
+# 5. Redémarrer l'optimizer
+docker compose start optimizer
+
+# 6. Le worker détecte la queue, récupère l'original depuis MinIO,
+#    retente l'optimizer, stocke dans Redis → ACK
+# Le front affiche l'image avec le badge 🐇 rabbit
+```
+
+---
+
+### 📊 Garanties offertes par RabbitMQ dans ce setup
+
+| Scénario | Comportement |
+|----------|-------------|
+| Optimizer KO au moment de l'upload | Job publié dans RabbitMQ (202) |
+| API redémarre avant que le worker traite | Message toujours dans RabbitMQ (durable + persistent) |
+| RabbitMQ redémarre | Queue et messages relus depuis le disque |
+| Worker crash en cours de traitement | Message re-délivré (pas d'ACK envoyé = pas supprimé) |
+| Optimizer revient | Worker ACK automatiquement au prochain cycle |
+| Même image uploadée deux fois | Redis HIT au second upload → 200 direct, RabbitMQ non sollicité |
 
 ---
 
