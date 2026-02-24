@@ -22,17 +22,33 @@ import (
 )
 
 const (
-	maxWidth  = 1920
-	maxHeight = 1080
-	quality   = 85
-	wmText    = "NWS © 2026"
+	maxWidth  = 1920 // largeur maximale après resize
+	maxHeight = 1080 // hauteur maximale après resize
+	quality   = 85   // qualité JPEG (bon compromis taille / qualité visuelle)
+
+	wmMargin     = 20 // marge entre le bord de l'image et le texte du watermark (px)
+	wmLineHeight = 52 // hauteur de ligne pour la police taille 48 (font size + marge interne)
+
+	// Zone d'échantillonnage pour le calcul de luminosité (pixels autour du watermark).
+	// Plus la zone est grande, plus la couleur adaptative est représentative du fond.
+	sampleW = 200
+	sampleH = 50
 )
 
+// sem limite la concurrence à un slot par coeur CPU pour éviter la saturation mémoire
+// lors du traitement simultané de plusieurs images volumineuses.
 var sem = make(chan struct{}, runtime.NumCPU())
+
+// bufPool réutilise les buffers JPEG entre les requêtes pour réduire la pression GC.
 var bufPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
+
+// fontFace est la police chargée une seule fois au démarrage et partagée entre toutes les requêtes.
+// opentype.Face est thread-safe en lecture.
 var fontFace font.Face
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
 	numCPU := runtime.NumCPU()
@@ -52,40 +68,35 @@ func main() {
 	http.ListenAndServe(":3001", mux)
 }
 
+// ── Handler ───────────────────────────────────────────────────────────────────
+
 func handleOptimize(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	log.Println("[OPTIMIZER] ┌─ Nouvelle image reçue")
 
-	// ── Worker Pool ───────────────────────────────────────
+	// ── ① Worker Pool ────────────────────────────────────
+	// On log avant d'acquérir le slot pour tracer les pics de charge.
 	slotsUsed := len(sem) + 1
 	totalSlots := cap(sem)
 	log.Printf("[OPTIMIZER] │ ① Worker pool  : slot %d/%d occupé", slotsUsed, totalSlots)
 
-	// Acquiert un slot — bloque si tous les slots sont pris
 	sem <- struct{}{}
 	defer func() {
-		<-sem // libère le slot
+		<-sem
 		log.Printf("[OPTIMIZER] │   Worker pool  : slot libéré (%d/%d utilisés)", len(sem), totalSlots)
 	}()
 
-	// ── Décodage ─────────────────────────────────────────
+	// ── ② Décodage ───────────────────────────────────────
 	t := time.Now()
-	file, _, err := r.FormFile("image")
+	img, format, err := decodeImage(r)
 	if err != nil {
-		http.Error(w, "Image manquante", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	img, format, err := image.Decode(file)
-	if err != nil {
-		http.Error(w, "Format invalide", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
 	log.Printf("[OPTIMIZER] │ ② Décodage     : format=%s | %dx%d | en %v", format, origW, origH, time.Since(t))
 
-	// ── Resize ───────────────────────────────────────────
+	// ── ③ Resize ─────────────────────────────────────────
 	t = time.Now()
 	resized := resize(img)
 	newW, newH := resized.Bounds().Dx(), resized.Bounds().Dy()
@@ -95,34 +106,208 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[OPTIMIZER] │ ③ Resize       : %dx%d → %dx%d | BiLinear | en %v", origW, origH, newW, newH, time.Since(t))
 	}
 
-	// ── Watermark ────────────────────────────────────────
+	// ── ④ Watermark ──────────────────────────────────────
 	t = time.Now()
-	watermarked, err := applyWatermark(resized)
+	wmText, wmPosition := wmParams(r)
+	watermarked, err := applyWatermark(resized, wmText, wmPosition)
 	if err != nil {
 		http.Error(w, "Erreur watermark", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[OPTIMIZER] │ ④ Watermark    : \"%s\" appliqué | police en mémoire | en %v", wmText, time.Since(t))
+	log.Printf("[OPTIMIZER] │ ④ Watermark    : \"%s\" @ %s | police en mémoire | en %v", wmText, wmPosition, time.Since(t))
 
-	// ── sync.Pool ─────────────────────────────────────────
+	// ── ⑤ Encodage JPEG ──────────────────────────────────
 	t = time.Now()
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer bufPool.Put(buf)
-	log.Printf("[OPTIMIZER] │ ⑤ sync.Pool    : buffer récupéré (recyclé, pas d'allocation)")
-
-	// ── Encodage JPEG ─────────────────────────────────────
-	if err := jpeg.Encode(buf, watermarked, &jpeg.Options{Quality: quality}); err != nil {
+	buf, err := encodeToBuffer(watermarked)
+	if err != nil {
 		http.Error(w, "Erreur encodage", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[OPTIMIZER] │ ⑥ JPEG encode  : qualité=%d%% | %s | en %v", quality, formatBytes(buf.Len()), time.Since(t))
+	defer bufPool.Put(buf)
+	log.Printf("[OPTIMIZER] │ ⑤ JPEG encode  : qualité=%d%% | %s | en %v", quality, formatBytes(buf.Len()), time.Since(t))
 	log.Printf("[OPTIMIZER] └─ ⏱ Total       : %v", time.Since(start))
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Write(buf.Bytes())
 }
 
+// ── Pipeline steps ────────────────────────────────────────────────────────────
+
+// decodeImage lit le fichier multipart "image" et le décode en image.Image.
+// On supporte JPEG et PNG (le blank import de image/png enregistre le décodeur).
+func decodeImage(r *http.Request) (image.Image, string, error) {
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		return nil, "", fmt.Errorf("image manquante")
+	}
+	defer file.Close()
+
+	img, format, err := image.Decode(file)
+	if err != nil {
+		return nil, "", fmt.Errorf("format invalide")
+	}
+	return img, format, nil
+}
+
+// wmParams lit les paramètres de watermark depuis le formulaire multipart.
+// Les valeurs par défaut garantissent un comportement cohérent même si le front
+// n'envoie pas ces champs (appels directs à l'API, retry RabbitMQ, etc.).
+func wmParams(r *http.Request) (text, position string) {
+	text = r.FormValue("wm_text")
+	if text == "" {
+		text = "NWS © 2026"
+	}
+	position = r.FormValue("wm_position")
+	if position == "" {
+		position = "bottom-right"
+	}
+	return
+}
+
+// encodeToBuffer encode l'image en JPEG dans un buffer recyclé depuis le sync.Pool.
+// Le caller est responsable de remettre le buffer dans le pool (defer bufPool.Put(buf)).
+func encodeToBuffer(img image.Image) (*bytes.Buffer, error) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	log.Printf("[OPTIMIZER] │   sync.Pool    : buffer récupéré (recyclé, pas d'allocation)")
+	if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: quality}); err != nil {
+		bufPool.Put(buf) // on remet le buffer même en cas d'erreur
+		return nil, err
+	}
+	return buf, nil
+}
+
+// ── Watermark ─────────────────────────────────────────────────────────────────
+
+// applyWatermark dessine le texte sur une copie RGBA de l'image source.
+// La couleur du texte est choisie dynamiquement en fonction de la luminosité
+// du fond à l'endroit où sera positionné le watermark.
+func applyWatermark(img image.Image, text, position string) (image.Image, error) {
+	// On copie l'image dans un canvas RGBA pour pouvoir y dessiner par-dessus.
+	canvas := image.NewRGBA(img.Bounds())
+	draw.Draw(canvas, canvas.Bounds(), img, image.Point{}, draw.Src)
+
+	textWidth := font.MeasureString(fontFace, text).Ceil()
+	wmX, wmY := wmCoords(textWidth, canvas.Bounds().Max.X, canvas.Bounds().Max.Y, position)
+	wmColor := adaptiveColor(img, wmX, wmY)
+
+	d := &font.Drawer{
+		Dst:  canvas,
+		Src:  image.NewUniform(wmColor),
+		Face: fontFace,
+		// Dot est la baseline du texte (coin bas-gauche du premier glyphe).
+		Dot: fixed.Point26_6{
+			X: fixed.I(wmX),
+			Y: fixed.I(wmY),
+		},
+	}
+	d.DrawString(text)
+
+	return canvas, nil
+}
+
+// wmCoords calcule les coordonnées (x, y) du point d'ancrage du watermark
+// en fonction de la position demandée et des dimensions de l'image.
+// (x, y) correspond à la baseline bas-gauche du texte dans le repère font.Drawer.
+func wmCoords(textWidth, w, h int, position string) (x, y int) {
+	switch position {
+	case "top-left":
+		return wmMargin, wmLineHeight + wmMargin
+	case "top-right":
+		return w - textWidth - wmMargin, wmLineHeight + wmMargin
+	case "bottom-left":
+		return wmMargin, h - wmMargin
+	default: // bottom-right
+		return w - textWidth - wmMargin, h - wmMargin
+	}
+}
+
+// ── Couleur adaptative ────────────────────────────────────────────────────────
+
+// adaptiveColor choisit blanc ou gris foncé selon la luminosité moyenne du fond
+// à l'endroit où sera tracé le watermark, afin de garantir la lisibilité
+// sur n'importe quelle image (claire ou sombre).
+func adaptiveColor(img image.Image, x, y int) color.RGBA {
+	avg := sampleLuminance(img, x, y)
+	log.Printf("[OPTIMIZER] │   Watermark    : luminosité zone=%.1f/255 → ", avg)
+
+	// Seuil 128 = mi-chemin entre noir (0) et blanc (255).
+	// En dessous : fond sombre → texte blanc. Au-dessus : fond clair → texte sombre.
+	if avg > 128 {
+		log.Printf("[OPTIMIZER] │                  fond CLAIR → texte sombre")
+		return color.RGBA{R: 30, G: 30, B: 30, A: 210}
+	}
+	log.Printf("[OPTIMIZER] │                  fond SOMBRE → texte blanc")
+	return color.RGBA{R: 255, G: 255, B: 255, A: 210}
+}
+
+// sampleLuminance calcule la luminance perceptuelle moyenne d'une zone de sampleW×sampleH px
+// à partir du coin (x, y). Les bords sont clampés aux limites de l'image.
+//
+// Formule ITU-R BT.601 : L = 0.299·R + 0.587·G + 0.114·B
+// Les coefficients reflètent la sensibilité de l'œil humain : vert > rouge > bleu.
+func sampleLuminance(img image.Image, x, y int) float64 {
+	bounds := img.Bounds()
+
+	// Calcul de la zone d'échantillonnage, clampée aux bords de l'image.
+	startX := x
+	startY := max(y-sampleH, bounds.Min.Y)
+	endX := min(startX+sampleW, bounds.Max.X)
+	endY := min(startY+sampleH, bounds.Max.Y)
+
+	var total float64
+	var count int
+
+	for py := startY; py < endY; py++ {
+		for px := startX; px < endX; px++ {
+			// RGBA() retourne des valeurs uint32 dans [0, 65535] ; >>8 ramène à [0, 255].
+			r, g, b, _ := img.At(px, py).RGBA()
+			total += 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return total / float64(count)
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+
+// resize redimensionne l'image si elle dépasse maxWidth×maxHeight,
+// en préservant le ratio. L'interpolation BiLinear offre un bon compromis
+// entre qualité visuelle et vitesse (meilleur que NearestNeighbor, moins coûteux que CatmullRom).
+func resize(img image.Image) image.Image {
+	w := img.Bounds().Dx()
+	h := img.Bounds().Dy()
+
+	// Si l'image tient déjà dans les limites, on la retourne telle quelle
+	// pour éviter une copie inutile.
+	if w <= maxWidth && h <= maxHeight {
+		return img
+	}
+
+	// On calcule les nouvelles dimensions en conservant le ratio d'aspect.
+	// La contrainte la plus restrictive (largeur ou hauteur) détermine l'échelle.
+	ratio := float64(w) / float64(h)
+	newW, newH := maxWidth, maxHeight
+	if float64(maxWidth)/float64(maxHeight) > ratio {
+		newW = int(float64(maxHeight) * ratio)
+	} else {
+		newH = int(float64(maxWidth) / ratio)
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Over, nil)
+	return dst
+}
+
+// ── Font ──────────────────────────────────────────────────────────────────────
+
+// loadFont charge la police TTF depuis le disque et crée le font.Face global.
+// Appelé une seule fois au démarrage : lire le disque à chaque requête serait trop coûteux.
+// FONT_PATH permet de surcharger la police via variable d'environnement (utile en Docker).
 func loadFont() error {
 	fontPath := os.Getenv("FONT_PATH")
 	if fontPath == "" {
@@ -135,6 +320,8 @@ func loadFont() error {
 		return err
 	}
 
+	// ParseCollection gère à la fois les fichiers .ttf (une seule fonte)
+	// et les collections .ttc (plusieurs fontes) — on prend toujours la première.
 	f, err := opentype.ParseCollection(fontBytes)
 	if err != nil {
 		return err
@@ -145,6 +332,7 @@ func loadFont() error {
 		return err
 	}
 
+	// Taille 48pt @ 72 DPI = 48px — visible sur des images jusqu'à 1920px de large.
 	fontFace, err = opentype.NewFace(font0, &opentype.FaceOptions{
 		Size: 48,
 		DPI:  72,
@@ -154,103 +342,7 @@ func loadFont() error {
 	return err
 }
 
-func applyWatermark(img image.Image) (image.Image, error) {
-	canvas := image.NewRGBA(img.Bounds())
-	draw.Draw(canvas, canvas.Bounds(), img, image.Point{}, draw.Src)
-
-	wmX := 20
-	wmY := canvas.Bounds().Max.Y - 40
-
-	// Échantillonne la zone où sera dessiné le watermark (200x50px en bas à gauche)
-	// pour calculer la luminosité moyenne du fond.
-	wmColor := adaptiveColor(img, wmX, wmY)
-
-	d := &font.Drawer{
-		Dst:  canvas,
-		Src:  image.NewUniform(wmColor),
-		Face: fontFace,
-		Dot: fixed.Point26_6{
-			X: fixed.I(wmX),
-			Y: fixed.I(wmY),
-		},
-	}
-	d.DrawString(wmText)
-
-	return canvas, nil
-}
-
-// adaptiveColor analyse la luminosité de la zone où sera positionné le watermark.
-// Luminosité = formule perceptuelle : l'oeil humain est plus sensible au vert qu'au rouge/bleu.
-// Si le fond est clair (luminosité > 128) → texte sombre.
-// Si le fond est sombre (luminosité ≤ 128) → texte blanc.
-func adaptiveColor(img image.Image, x, y int) color.RGBA {
-	bounds := img.Bounds()
-
-	// Zone d'échantillonnage : rectangle de 200x50px autour du watermark
-	sampleW := 200
-	sampleH := 50
-	startX := x
-	startY := y - sampleH
-	if startY < bounds.Min.Y {
-		startY = bounds.Min.Y
-	}
-	endX := startX + sampleW
-	if endX > bounds.Max.X {
-		endX = bounds.Max.X
-	}
-	endY := startY + sampleH
-	if endY > bounds.Max.Y {
-		endY = bounds.Max.Y
-	}
-
-	var totalLuminance float64
-	var count int
-
-	for py := startY; py < endY; py++ {
-		for px := startX; px < endX; px++ {
-			r, g, b, _ := img.At(px, py).RGBA()
-			// Convertit de uint32 (0-65535) en float64 (0-255)
-			// Formule perceptuelle ITU-R BT.601 : l'oeil voit mieux le vert
-			luminance := 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
-			totalLuminance += luminance
-			count++
-		}
-	}
-
-	avgLuminance := totalLuminance / float64(count)
-
-	log.Printf("[OPTIMIZER] │   Watermark    : luminosité zone=%.1f/255 → ", avgLuminance)
-
-	// Fond clair → texte sombre | Fond sombre → texte blanc
-	if avgLuminance > 128 {
-		log.Printf("[OPTIMIZER] │                  fond CLAIR → texte sombre")
-		return color.RGBA{R: 30, G: 30, B: 30, A: 210}
-	}
-	log.Printf("[OPTIMIZER] │                  fond SOMBRE → texte blanc")
-	return color.RGBA{R: 255, G: 255, B: 255, A: 210}
-}
-
-func resize(img image.Image) image.Image {
-	w := img.Bounds().Dx()
-	h := img.Bounds().Dy()
-
-	if w <= maxWidth && h <= maxHeight {
-		return img
-	}
-
-	ratio := float64(w) / float64(h)
-	newW, newH := maxWidth, maxHeight
-
-	if float64(maxWidth)/float64(maxHeight) > ratio {
-		newW = int(float64(maxHeight) * ratio)
-	} else {
-		newH = int(float64(maxWidth) / ratio)
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
-	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, img.Bounds(), xdraw.Over, nil)
-	return dst
-}
+// ── Utilitaires ───────────────────────────────────────────────────────────────
 
 func formatBytes(b int) string {
 	if b < 1024 {
