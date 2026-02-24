@@ -47,6 +47,7 @@ type RetryJob struct {
 	Filename    string `json:"filename"`
 	WmText      string `json:"wm_text"`
 	WmPosition  string `json:"wm_position"`
+	WmFormat    string `json:"wm_format"`
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -175,7 +176,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	readDur := time.Since(tRead)
 	logger.Info().Str("step", "read").Str("filename", header.Filename).Str("size", formatBytes(len(data))).Dur("duration", readDur).Msg("lecture image")
 
-	// ── ① bis Paramètres watermark ───────────────────────
+	// ── ① bis Paramètres watermark + format de sortie ────
 	wmText := r.FormValue("wm_text")
 	if wmText == "" {
 		wmText = "NWS © 2026"
@@ -184,18 +185,23 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if wmPosition == "" {
 		wmPosition = "bottom-right"
 	}
+	// Négociation de format : WebP si le navigateur le supporte, JPEG sinon.
+	// Même logique en fallback dans l'optimizer si wm_format est absent.
+	wmFormat := bestFormat(r)
+	logger.Info().Str("step", "format").Str("accept", r.Header.Get("Accept")).Str("chosen", wmFormat).Msg("négociation format")
 
 	// ── ② Hash SHA256 ─────────────────────────────────────
-	// La clé de cache inclut image + texte + position pour garantir l'unicité.
+	// La clé de cache inclut image + texte + position + format pour garantir l'unicité.
+	// Un même upload avec Accept: image/webp et Accept: image/jpeg → deux entrées Redis distinctes.
 	tHash := time.Now()
-	hashInput := append(data, []byte(wmText+"|"+wmPosition)...)
+	hashInput := append(data, []byte(wmText+"|"+wmPosition+"|"+wmFormat)...)
 	sum := sha256.Sum256(hashInput)
 	cacheKey := hex.EncodeToString(sum[:])
 	// La clé MinIO est basée sur l'image uniquement pour éviter de stocker N fois la même image.
 	imgSum := sha256.Sum256(data)
 	originalKey := "original/" + hex.EncodeToString(imgSum[:]) + ".jpg"
 	hashDur := time.Since(tHash)
-	logger.Info().Str("step", "hash").Str("key", cacheKey[:16]).Dur("duration", hashDur).Msg("sha256")
+	logger.Info().Str("step", "hash").Str("key", cacheKey[:16]).Str("format", wmFormat).Dur("duration", hashDur).Msg("sha256")
 
 	ctx := context.Background()
 
@@ -208,6 +214,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-T-Read", fmtMs(readDur))
 		w.Header().Set("X-T-Hash", fmtMs(hashDur))
 		w.Header().Set("X-T-Redis", fmtMs(redisDur))
+		w.Header().Set("Vary", "Accept")
 		sendResponse(w, r, cached)
 		return
 	}
@@ -223,7 +230,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tOptimizer := time.Now()
-	result, err := sendToOptimizer(optimizerURL, header.Filename, data, wmText, wmPosition)
+	result, err := sendToOptimizer(optimizerURL, header.Filename, data, wmText, wmPosition, wmFormat)
 	if err != nil {
 		logger.Error().Str("step", "optimizer").Err(err).Msg("optimizer KO")
 		w.Header().Set("X-Cache", "MISS")
@@ -231,11 +238,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-T-Hash", fmtMs(hashDur))
 		w.Header().Set("X-T-Redis", fmtMs(redisDur))
 		w.Header().Set("X-T-Minio", fmtMs(minioDur))
-		replyWithRetryJob(w, ctx, cacheKey, originalKey, header.Filename, wmText, wmPosition, start)
+		replyWithRetryJob(w, ctx, cacheKey, originalKey, header.Filename, wmText, wmPosition, wmFormat, start)
 		return
 	}
 	optimizerDur := time.Since(tOptimizer)
-	logger.Info().Str("step", "optimizer").Str("size", formatBytes(len(result))).Dur("duration", optimizerDur).Msg("image optimisée")
+	logger.Info().Str("step", "optimizer").Str("format", wmFormat).Str("size", formatBytes(len(result))).Dur("duration", optimizerDur).Msg("image optimisée")
 
 	// ── ⑥ Stockage Redis ──────────────────────────────────
 	tStore := time.Now()
@@ -245,7 +252,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// ── ⑦ Réponse ─────────────────────────────────────────
 	gzipped := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-	logger.Info().Str("step", "response").Bool("gzip", gzipped).Str("size", formatBytes(len(result))).Msg("envoi réponse")
+	logger.Info().Str("step", "response").Bool("gzip", gzipped).Str("format", wmFormat).Str("size", formatBytes(len(result))).Msg("envoi réponse")
 	logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Bool("cache_hit", false).Msg("requête terminée")
 
 	w.Header().Set("X-Cache", "MISS")
@@ -255,6 +262,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-T-Minio", fmtMs(minioDur))
 	w.Header().Set("X-T-Optimizer", fmtMs(optimizerDur))
 	w.Header().Set("X-T-Store", fmtMs(storeDur))
+	w.Header().Set("Vary", "Accept")
 	sendResponse(w, r, result)
 }
 
@@ -292,6 +300,7 @@ func handleGetImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Vary", "Accept")
 	sendResponse(w, r, data)
 }
 
@@ -328,7 +337,7 @@ func processRetryJob(msg amqp.Delivery, optimizerURL string) {
 		msg.Ack(false)
 		return
 	}
-	wlog.Info().Str("hash", job.Hash[:16]).Str("filename", job.Filename).Msg("job reçu")
+	wlog.Info().Str("hash", job.Hash[:16]).Str("filename", job.Filename).Str("format", job.WmFormat).Msg("job reçu")
 
 	// ── ① Récupérer l'original depuis MinIO ──────────────
 	data, err := fetchFromMinio(job.OriginalKey)
@@ -341,7 +350,7 @@ func processRetryJob(msg amqp.Delivery, optimizerURL string) {
 
 	// ── ② Retenter l'optimizer ───────────────────────────
 	t := time.Now()
-	result, err := sendToOptimizer(optimizerURL, job.Filename, data, job.WmText, job.WmPosition)
+	result, err := sendToOptimizer(optimizerURL, job.Filename, data, job.WmText, job.WmPosition, job.WmFormat)
 	if err != nil {
 		wlog.Error().Err(err).Str("step", "optimizer").Msg("optimizer toujours KO - nack requeue dans 10s")
 		msg.Nack(false, true)
@@ -360,6 +369,29 @@ func processRetryJob(msg amqp.Delivery, optimizerURL string) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// bestFormat lit le header Accept et retourne "webp" ou "jpeg".
+// WebP offre ~30% de réduction par rapport à JPEG à qualité visuelle équivalente.
+func bestFormat(r *http.Request) string {
+	if strings.Contains(r.Header.Get("Accept"), "image/webp") {
+		return "webp"
+	}
+	return "jpeg"
+}
+
+// detectContentType identifie le format à partir des magic bytes.
+// Utilisé pour fixer le Content-Type correct sur les réponses cache HIT
+// sans avoir besoin de stocker le type séparément dans Redis.
+//
+// Magic bytes : WebP = "RIFF????WEBP" | JPEG = 0xFF 0xD8
+func detectContentType(data []byte) string {
+	if len(data) >= 12 &&
+		data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+		data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' {
+		return "image/webp"
+	}
+	return "image/jpeg"
+}
 
 // getFromCache vérifie le cache Redis et retourne les données + durée du lookup.
 func getFromCache(ctx context.Context, key string) ([]byte, time.Duration, bool) {
@@ -403,8 +435,8 @@ func fetchFromMinio(key string) ([]byte, error) {
 }
 
 // publishRetryJob publie un job dans RabbitMQ quand l'optimizer est KO.
-func publishRetryJob(ctx context.Context, hash, originalKey, filename, wmText, wmPosition string) error {
-	job := RetryJob{Hash: hash, OriginalKey: originalKey, Filename: filename, WmText: wmText, WmPosition: wmPosition}
+func publishRetryJob(ctx context.Context, hash, originalKey, filename, wmText, wmPosition, wmFormat string) error {
+	job := RetryJob{Hash: hash, OriginalKey: originalKey, Filename: filename, WmText: wmText, WmPosition: wmPosition, WmFormat: wmFormat}
 	body, _ := json.Marshal(job)
 
 	t := time.Now()
@@ -424,9 +456,9 @@ func publishRetryJob(ctx context.Context, hash, originalKey, filename, wmText, w
 }
 
 // replyWithRetryJob publie le job RabbitMQ et répond 202 au client.
-func replyWithRetryJob(w http.ResponseWriter, ctx context.Context, cacheKey, originalKey, filename, wmText, wmPosition string, start time.Time) {
+func replyWithRetryJob(w http.ResponseWriter, ctx context.Context, cacheKey, originalKey, filename, wmText, wmPosition, wmFormat string, start time.Time) {
 	tRabbit := time.Now()
-	if err := publishRetryJob(ctx, cacheKey, originalKey, filename, wmText, wmPosition); err != nil {
+	if err := publishRetryJob(ctx, cacheKey, originalKey, filename, wmText, wmPosition, wmFormat); err != nil {
 		http.Error(w, "Microservice indisponible", http.StatusBadGateway)
 		return
 	}
@@ -440,7 +472,7 @@ func replyWithRetryJob(w http.ResponseWriter, ctx context.Context, cacheKey, ori
 }
 
 // sendToOptimizer envoie l'image à l'optimizer via HTTP multipart et retourne le résultat.
-func sendToOptimizer(optimizerURL, filename string, data []byte, wmText, wmPosition string) ([]byte, error) {
+func sendToOptimizer(optimizerURL, filename string, data []byte, wmText, wmPosition, wmFormat string) ([]byte, error) {
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 
@@ -453,6 +485,7 @@ func sendToOptimizer(optimizerURL, filename string, data []byte, wmText, wmPosit
 		io.Copy(part, bytes.NewReader(data))
 		mw.WriteField("wm_text", wmText)
 		mw.WriteField("wm_position", wmPosition)
+		mw.WriteField("wm_format", wmFormat)
 		mw.Close()
 		pw.Close()
 	}()
@@ -465,8 +498,13 @@ func sendToOptimizer(optimizerURL, filename string, data []byte, wmText, wmPosit
 	return io.ReadAll(resp.Body)
 }
 
+// sendResponse envoie les données au client avec le bon Content-Type (détecté par magic bytes)
+// et compression gzip si le navigateur le supporte.
 func sendResponse(w http.ResponseWriter, r *http.Request, data []byte) {
-	w.Header().Set("Content-Type", "image/jpeg")
+	// detectContentType évite de stocker le type séparément dans Redis :
+	// on lit les 12 premiers octets de la réponse pour identifier JPEG vs WebP.
+	ct := detectContentType(data)
+	w.Header().Set("Content-Type", ct)
 
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		w.Header().Set("Content-Encoding", "gzip")

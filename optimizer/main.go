@@ -8,12 +8,14 @@ import (
 	"image/draw"
 	"image/jpeg"
 	_ "image/png"
+	"io"
 	"net/http"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/chai2010/webp"
 	"github.com/rs/zerolog"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
@@ -24,7 +26,9 @@ import (
 const (
 	maxWidth  = 1920 // largeur maximale après resize
 	maxHeight = 1080 // hauteur maximale après resize
-	quality   = 85   // qualité JPEG (bon compromis taille / qualité visuelle)
+
+	maxInputWidth  = 8000 // validation: on refuse les images absurdement grandes
+	maxInputHeight = 8000
 
 	wmMargin     = 20 // marge entre le bord de l'image et le texte du watermark (px)
 	wmLineHeight = 52 // hauteur de ligne pour la police taille 48 (font size + marge interne)
@@ -39,7 +43,7 @@ const (
 // lors du traitement simultané de plusieurs images volumineuses.
 var sem = make(chan struct{}, runtime.NumCPU())
 
-// bufPool réutilise les buffers JPEG entre les requêtes pour réduire la pression GC.
+// bufPool réutilise les buffers JPEG/WebP entre les requêtes pour réduire la pression GC.
 var bufPool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
@@ -87,7 +91,7 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		logger.Info().Str("step", "worker_pool").Int("used", len(sem)).Int("total", totalSlots).Msg("slot libéré")
 	}()
 
-	// ── ② Décodage ───────────────────────────────────────
+	// ── ② Décodage (lazy validation + full decode) ────────
 	t := time.Now()
 	img, format, err := decodeImage(r)
 	if err != nil {
@@ -95,7 +99,7 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
-	logger.Info().Str("step", "decode").Str("format", format).Int("width", origW).Int("height", origH).Dur("duration", time.Since(t)).Msg("décodage")
+	logger.Info().Str("step", "decode").Str("format", format).Int("width", origW).Int("height", origH).Dur("duration", time.Since(t)).Msg("décodage + strip EXIF")
 
 	// ── ③ Resize ─────────────────────────────────────────
 	t = time.Now()
@@ -109,7 +113,7 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 
 	// ── ④ Watermark ──────────────────────────────────────
 	t = time.Now()
-	wmText, wmPosition := wmParams(r)
+	wmText, wmPosition, wmFormat := wmParams(r)
 	watermarked, err := applyWatermark(resized, wmText, wmPosition)
 	if err != nil {
 		http.Error(w, "Erreur watermark", http.StatusInternalServerError)
@@ -117,25 +121,26 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.Info().Str("step", "watermark").Str("text", wmText).Str("position", wmPosition).Dur("duration", time.Since(t)).Msg("watermark appliqué")
 
-	// ── ⑤ Encodage JPEG ──────────────────────────────────
+	// ── ⑤ Encodage ────────────────────────────────────────
 	t = time.Now()
-	buf, err := encodeToBuffer(watermarked)
+	buf, contentType, q, err := encodeToBuffer(watermarked, wmFormat)
 	if err != nil {
 		http.Error(w, "Erreur encodage", http.StatusInternalServerError)
 		return
 	}
 	defer bufPool.Put(buf)
-	logger.Info().Str("step", "encode").Int("quality", quality).Str("size", formatBytes(buf.Len())).Dur("duration", time.Since(t)).Msg("encodage JPEG")
+	logger.Info().Str("step", "encode").Str("format", wmFormat).Int("quality", q).Str("size", formatBytes(buf.Len())).Dur("duration", time.Since(t)).Msg("encodage")
 	logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Msg("image traitée")
 
-	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Content-Type", contentType)
 	w.Write(buf.Bytes())
 }
 
 // ── Pipeline steps ────────────────────────────────────────────────────────────
 
-// decodeImage lit le fichier multipart "image" et le décode en image.Image.
-// On supporte JPEG et PNG (le blank import de image/png enregistre le décodeur).
+// decodeImage valide les dimensions via DecodeConfig (sans décoder les pixels),
+// puis effectue le décodage complet. Le ré-encodage ultérieur supprime automatiquement
+// les métadonnées EXIF (GPS, miniature, profil ICC) — gain de 5-15% sur les photos iPhone.
 func decodeImage(r *http.Request) (image.Image, string, error) {
 	file, _, err := r.FormFile("image")
 	if err != nil {
@@ -143,9 +148,25 @@ func decodeImage(r *http.Request) (image.Image, string, error) {
 	}
 	defer file.Close()
 
-	img, format, err := image.Decode(file)
+	// ① Lazy decode : lit uniquement le header (quelques Ko) pour valider les dimensions
+	// sans décompresser les ~25 millions de pixels d'une image 4K.
+	config, format, err := image.DecodeConfig(file)
 	if err != nil {
 		return nil, "", fmt.Errorf("format invalide")
+	}
+	if config.Width > maxInputWidth || config.Height > maxInputHeight {
+		return nil, "", fmt.Errorf("image trop grande (max %dx%d, reçu %dx%d)", maxInputWidth, maxInputHeight, config.Width, config.Height)
+	}
+	logger.Debug().Str("step", "lazy_decode").Str("format", format).Int("width", config.Width).Int("height", config.Height).Msg("dimensions validées sans décodage pixels")
+
+	// ② Seek back to start before full decode — DecodeConfig a consommé le reader.
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, "", fmt.Errorf("seek échoué")
+	}
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return nil, "", fmt.Errorf("décodage échoué")
 	}
 	return img, format, nil
 }
@@ -153,7 +174,7 @@ func decodeImage(r *http.Request) (image.Image, string, error) {
 // wmParams lit les paramètres de watermark depuis le formulaire multipart.
 // Les valeurs par défaut garantissent un comportement cohérent même si le front
 // n'envoie pas ces champs (appels directs à l'API, retry RabbitMQ, etc.).
-func wmParams(r *http.Request) (text, position string) {
+func wmParams(r *http.Request) (text, position, format string) {
 	text = r.FormValue("wm_text")
 	if text == "" {
 		text = "NWS © 2026"
@@ -162,20 +183,57 @@ func wmParams(r *http.Request) (text, position string) {
 	if position == "" {
 		position = "bottom-right"
 	}
+	format = r.FormValue("wm_format")
+	if format != "webp" {
+		format = "jpeg" // seuls jpeg et webp sont supportés
+	}
 	return
 }
 
-// encodeToBuffer encode l'image en JPEG dans un buffer recyclé depuis le sync.Pool.
+// encodeToBuffer encode l'image dans un buffer recyclé depuis le sync.Pool.
+// La qualité est adaptée dynamiquement aux dimensions de l'image de sortie.
+// Retourne le buffer, le content-type et la qualité utilisée (pour le log).
 // Le caller est responsable de remettre le buffer dans le pool (defer bufPool.Put(buf)).
-func encodeToBuffer(img image.Image) (*bytes.Buffer, error) {
+func encodeToBuffer(img image.Image, format string) (*bytes.Buffer, string, int, error) {
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	q := adaptiveQuality(w, h)
+
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	logger.Debug().Str("step", "pool").Msg("buffer récupéré depuis sync.Pool")
-	if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: quality}); err != nil {
-		bufPool.Put(buf) // on remet le buffer même en cas d'erreur
-		return nil, err
+
+	switch format {
+	case "webp":
+		// WebP qualité : environ 5 points en dessous de JPEG pour une qualité perçue équivalente.
+		// Ex: JPEG 85 ≈ WebP 80 — le codec WebP est plus efficace à même valeur numérique.
+		wq := float32(q - 5)
+		if err := webp.Encode(buf, img, &webp.Options{Lossless: false, Quality: wq}); err != nil {
+			bufPool.Put(buf)
+			return nil, "", 0, err
+		}
+		return buf, "image/webp", int(wq), nil
+
+	default: // jpeg
+		if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: q}); err != nil {
+			bufPool.Put(buf)
+			return nil, "", 0, err
+		}
+		return buf, "image/jpeg", q, nil
 	}
-	return buf, nil
+}
+
+// adaptiveQuality choisit la qualité JPEG en fonction du nombre de pixels de l'image de sortie.
+// Plus l'image est grande, plus elle mérite une qualité élevée pour préserver les détails.
+func adaptiveQuality(w, h int) int {
+	pixels := w * h
+	switch {
+	case pixels < 500*500:   // miniature (< 250K pixels)
+		return 80
+	case pixels < 1920*1080: // HD (< 2M pixels)
+		return 85
+	default: // Full HD et au-delà
+		return 90
+	}
 }
 
 // ── Watermark ─────────────────────────────────────────────────────────────────
@@ -245,33 +303,71 @@ func adaptiveColor(img image.Image, x, y int) color.RGBA {
 // sampleLuminance calcule la luminance perceptuelle moyenne d'une zone de sampleW×sampleH px
 // à partir du coin (x, y). Les bords sont clampés aux limites de l'image.
 //
+// Parallélisation : les lignes sont découpées en numCPU chunks, chaque goroutine écrit
+// dans son index de totals[i] — sans mutex, sans false sharing (indices indépendants).
+// Fallback séquentiel si rows < numCPU (overhead goroutine > gain).
+//
 // Formule ITU-R BT.601 : L = 0.299·R + 0.587·G + 0.114·B
 // Les coefficients reflètent la sensibilité de l'œil humain : vert > rouge > bleu.
 func sampleLuminance(img image.Image, x, y int) float64 {
 	bounds := img.Bounds()
 
-	// Calcul de la zone d'échantillonnage, clampée aux bords de l'image.
 	startX := x
 	startY := max(y-sampleH, bounds.Min.Y)
 	endX := min(startX+sampleW, bounds.Max.X)
 	endY := min(startY+sampleH, bounds.Max.Y)
 
-	var total float64
-	var count int
-
-	for py := startY; py < endY; py++ {
-		for px := startX; px < endX; px++ {
-			// RGBA() retourne des valeurs uint32 dans [0, 65535] ; >>8 ramène à [0, 255].
-			r, g, b, _ := img.At(px, py).RGBA()
-			total += 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
-			count++
-		}
-	}
-
-	if count == 0 {
+	rows := endY - startY
+	cols := endX - startX
+	if rows == 0 || cols == 0 {
 		return 0
 	}
-	return total / float64(count)
+
+	numWorkers := runtime.NumCPU()
+
+	// Sous ce seuil l'overhead de création des goroutines dépasse le gain de parallélisme.
+	if rows < numWorkers {
+		var total float64
+		for py := startY; py < endY; py++ {
+			for px := startX; px < endX; px++ {
+				r, g, b, _ := img.At(px, py).RGBA()
+				total += 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
+			}
+		}
+		return total / float64(rows*cols)
+	}
+
+	// Chaque worker somme ses lignes dans totals[i] — pas de contention, pas de mutex.
+	totals := make([]float64, numWorkers)
+	chunkSize := (rows + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		rowStart := startY + i*chunkSize
+		rowEnd := min(rowStart+chunkSize, endY)
+		if rowStart >= endY {
+			break
+		}
+		wg.Add(1)
+		go func(rStart, rEnd, idx int) {
+			defer wg.Done()
+			var t float64
+			for py := rStart; py < rEnd; py++ {
+				for px := startX; px < endX; px++ {
+					r, g, b, _ := img.At(px, py).RGBA()
+					t += 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
+				}
+			}
+			totals[idx] = t
+		}(rowStart, rowEnd, i)
+	}
+	wg.Wait()
+
+	var total float64
+	for _, t := range totals {
+		total += t
+	}
+	return total / float64(rows*cols)
 }
 
 // ── Resize ────────────────────────────────────────────────────────────────────
