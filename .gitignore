@@ -3,3 +3,4 @@ api/api
 optimizer/optimizer
 *.exe
 .env
+.claude
