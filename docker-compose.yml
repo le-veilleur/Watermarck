@@ -7,10 +7,31 @@ services:
     # désactive la persistance sur disque → Redis utilisé uniquement comme cache RAM
     command: redis-server --save "" --appendonly no
 
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5541:5540"    # Dashboard Redis Insight
+    depends_on:
+      - redis
+
   optimizer:
     build: ./optimizer
     ports:
       - "3001:3001"
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   api:
     build: ./api
@@ -22,10 +43,12 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
     depends_on:
       - optimizer
       - redis
       - minio
+      - rabbitmq
 
   minio:
     image: minio/minio:latest
