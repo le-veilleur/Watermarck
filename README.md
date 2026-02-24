@@ -9,6 +9,8 @@
 |----------|---------|
 | [📄 REDIS.md](./REDIS.md) | Structures de données, cache, Pub/Sub, persistance, Cluster |
 | [📄 RABBITMQ.md](./RABBITMQ.md) | Exchanges, Queues, ACK, DLQ, Publisher Confirms, Option B implémentée |
+| [📄 IOPIPE.md](./IOPIPE.md) | io.Pipe, protocole ping-pong, channels, goroutines, streaming sans buffer |
+| [📄 GZIP.md](./GZIP.md) | Compression gzip, LZ77, Huffman, format fichier, niveaux, HTTP Content-Encoding |
 
 ---
 
