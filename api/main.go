@@ -9,13 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/minio/minio-go/v7"
@@ -33,6 +33,13 @@ var redisClient *redis.Client
 var minioClient *minio.Client
 var amqpChan *amqp.Channel
 
+// logger est le logger structuré pour le handler HTTP.
+// wlog est le logger du worker RabbitMQ (champ component=worker ajouté).
+var (
+	logger zerolog.Logger
+	wlog   zerolog.Logger
+)
+
 // RetryJob représente un job publié dans RabbitMQ quand l'optimizer est KO.
 type RetryJob struct {
 	Hash        string `json:"hash"`
@@ -44,6 +51,9 @@ type RetryJob struct {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 func main() {
+	zerolog.TimeFieldFormat = time.RFC3339
+	logger = zerolog.New(os.Stdout).With().Timestamp().Str("service", "api").Logger()
+	wlog = logger.With().Str("component", "worker").Logger()
 
 	redisClient = initRedis()
 	minioClient = initMinio()
@@ -51,8 +61,7 @@ func main() {
 
 	go retryWorker()
 
-	log.Println("[API] Démarrage sur :3000")
-	log.Println("[API] ─────────────────────────────────────────")
+	logger.Info().Str("addr", ":3000").Msg("démarrage")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /upload", handleUpload)
@@ -71,17 +80,16 @@ func initRedis() *redis.Client {
 	}
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
-		log.Fatalf("[API] Redis URL invalide : %v", err)
+		logger.Fatal().Err(err).Msg("redis URL invalide")
 	}
 	client := redis.NewClient(opt)
 	if err := client.Ping(context.Background()).Err(); err != nil {
-		log.Fatalf("[API] Impossible de se connecter à Redis : %v", err)
+		logger.Fatal().Err(err).Msg("impossible de se connecter à redis")
 	}
-	log.Println("[API] ✓ Redis connecté")
+	logger.Info().Str("component", "init").Msg("redis connecté")
 	return client
 }
 
-// 
 func initMinio() *minio.Client {
 	// On lit les infos de connexion à MinIO depuis les variables d'environnement, avec des valeurs par défaut pour le dev local.
 	endpoint := os.Getenv("MINIO_ENDPOINT")
@@ -104,21 +112,21 @@ func initMinio() *minio.Client {
 		Secure: false,
 	})
 	if err != nil {
-		log.Fatalf("[API] MinIO client invalide : %v", err)
+		logger.Fatal().Err(err).Msg("minio client invalide")
 	}
 
 	ctx := context.Background()
 	exists, err := client.BucketExists(ctx, minioBucket)
 	if err != nil {
-		log.Fatalf("[API] MinIO inaccessible : %v", err)
+		logger.Fatal().Err(err).Msg("minio inaccessible")
 	}
 	if !exists {
 		if err := client.MakeBucket(ctx, minioBucket, minio.MakeBucketOptions{}); err != nil {
-			log.Fatalf("[API] Impossible de créer le bucket MinIO : %v", err)
+			logger.Fatal().Err(err).Str("bucket", minioBucket).Msg("impossible de créer le bucket")
 		}
-		log.Printf("[API] ✓ MinIO bucket '%s' créé", minioBucket)
+		logger.Info().Str("component", "init").Str("bucket", minioBucket).Msg("bucket minio créé")
 	} else {
-		log.Printf("[API] ✓ MinIO connecté | bucket '%s' existant", minioBucket)
+		logger.Info().Str("component", "init").Str("bucket", minioBucket).Msg("minio connecté")
 	}
 	return client
 }
@@ -131,17 +139,17 @@ func initRabbitMQ() *amqp.Channel {
 	}
 	conn, err := amqp.Dial(rabbitmqURL)
 	if err != nil {
-		log.Fatalf("[API] Impossible de se connecter à RabbitMQ : %v", err)
+		logger.Fatal().Err(err).Msg("impossible de se connecter à rabbitmq")
 	}
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("[API] Impossible d'ouvrir un channel RabbitMQ : %v", err)
+		logger.Fatal().Err(err).Msg("impossible d'ouvrir un channel rabbitmq")
 	}
 	_, err = ch.QueueDeclare("watermark_retry", true, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("[API] Impossible de déclarer la queue RabbitMQ : %v", err)
+		logger.Fatal().Err(err).Str("queue", "watermark_retry").Msg("impossible de déclarer la queue")
 	}
-	log.Println("[API] ✓ RabbitMQ connecté | queue 'watermark_retry' déclarée")
+	logger.Info().Str("component", "init").Str("queue", "watermark_retry").Msg("rabbitmq connecté")
 	return ch
 }
 
@@ -149,8 +157,6 @@ func initRabbitMQ() *amqp.Channel {
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	log.Println("[API] ════════════════════════════════════════")
-	log.Println("[API] → Nouvelle requête reçue")
 
 	// ── ① Lecture ────────────────────────────────────────
 	file, header, err := r.FormFile("image")
@@ -167,7 +173,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	readDur := time.Since(tRead)
-	log.Printf("[API] ① Lecture    : %s | %s | %v", header.Filename, formatBytes(len(data)), readDur)
+	logger.Info().Str("step", "read").Str("filename", header.Filename).Str("size", formatBytes(len(data))).Dur("duration", readDur).Msg("lecture image")
 
 	// ── ① bis Paramètres watermark ───────────────────────
 	wmText := r.FormValue("wm_text")
@@ -189,16 +195,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	imgSum := sha256.Sum256(data)
 	originalKey := "original/" + hex.EncodeToString(imgSum[:]) + ".jpg"
 	hashDur := time.Since(tHash)
-	log.Printf("[API] ② SHA256     : %s... | calculé en %v", cacheKey[:16], hashDur)
+	logger.Info().Str("step", "hash").Str("key", cacheKey[:16]).Dur("duration", hashDur).Msg("sha256")
 
 	ctx := context.Background()
 
 	// ── ③ Cache Redis ─────────────────────────────────────
 	cached, redisDur, hit := getFromCache(ctx, cacheKey)
 	if hit {
-		log.Printf("[API] ③ Redis      : ✅ CACHE HIT  | %s récupérés en %v", formatBytes(len(cached)), redisDur)
-		log.Printf("[API] ⚡ Total      : %v (sans passer par l'optimizer !)", time.Since(start))
-		log.Println("[API] ════════════════════════════════════════")
+		logger.Info().Str("step", "cache").Bool("hit", true).Str("size", formatBytes(len(cached))).Dur("duration", redisDur).Msg("redis lookup")
+		logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Bool("cache_hit", true).Msg("requête terminée")
 		w.Header().Set("X-Cache", "HIT")
 		w.Header().Set("X-T-Read", fmtMs(readDur))
 		w.Header().Set("X-T-Hash", fmtMs(hashDur))
@@ -206,7 +211,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, r, cached)
 		return
 	}
-	log.Printf("[API] ③ Redis      : ❌ CACHE MISS | lookup en %v", redisDur)
+	logger.Info().Str("step", "cache").Bool("hit", false).Dur("duration", redisDur).Msg("redis lookup")
 
 	// ── ④ Sauvegarde original dans MinIO ──────────────────
 	minioDur := saveOriginal(ctx, originalKey, data)
@@ -220,7 +225,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	tOptimizer := time.Now()
 	result, err := sendToOptimizer(optimizerURL, header.Filename, data, wmText, wmPosition)
 	if err != nil {
-		log.Printf("[API] ⑤ Optimizer  : ❌ KO : %v", err)
+		logger.Error().Str("step", "optimizer").Err(err).Msg("optimizer KO")
 		w.Header().Set("X-Cache", "MISS")
 		w.Header().Set("X-T-Read", fmtMs(readDur))
 		w.Header().Set("X-T-Hash", fmtMs(hashDur))
@@ -230,18 +235,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	optimizerDur := time.Since(tOptimizer)
-	log.Printf("[API] ⑤ Optimizer  : ✓ %s reçus en %v", formatBytes(len(result)), optimizerDur)
+	logger.Info().Str("step", "optimizer").Str("size", formatBytes(len(result))).Dur("duration", optimizerDur).Msg("image optimisée")
 
 	// ── ⑥ Stockage Redis ──────────────────────────────────
 	tStore := time.Now()
 	redisClient.Set(ctx, cacheKey, result, 24*time.Hour)
 	storeDur := time.Since(tStore)
-	log.Printf("[API] ⑥ Redis.Set  : ✓ %s stockés | TTL 24h | en %v", formatBytes(len(result)), storeDur)
+	logger.Info().Str("step", "redis_set").Str("size", formatBytes(len(result))).Dur("duration", storeDur).Msg("résultat mis en cache")
 
 	// ── ⑦ Réponse ─────────────────────────────────────────
-	log.Printf("[API] ⑦ Réponse    : gzip=%v | taille=%s", strings.Contains(r.Header.Get("Accept-Encoding"), "gzip"), formatBytes(len(result)))
-	log.Printf("[API] ⏱ Total      : %v", time.Since(start))
-	log.Println("[API] ════════════════════════════════════════")
+	gzipped := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	logger.Info().Str("step", "response").Bool("gzip", gzipped).Str("size", formatBytes(len(result))).Msg("envoi réponse")
+	logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Bool("cache_hit", false).Msg("requête terminée")
 
 	w.Header().Set("X-Cache", "MISS")
 	w.Header().Set("X-T-Read", fmtMs(readDur))
@@ -293,15 +298,15 @@ func handleGetImage(w http.ResponseWriter, r *http.Request) {
 // ── Worker ────────────────────────────────────────────────────────────────────
 
 func retryWorker() {
-	log.Println("[Worker] ✓ Démarrage du worker retry RabbitMQ | queue 'watermark_retry'")
+	wlog.Info().Str("queue", "watermark_retry").Msg("worker démarré")
 
 	if err := amqpChan.Qos(1, 0, false); err != nil {
-		log.Fatalf("[Worker] Impossible de configurer Qos : %v", err)
+		wlog.Fatal().Err(err).Msg("impossible de configurer qos")
 	}
 
 	msgs, err := amqpChan.Consume("watermark_retry", "", false, false, false, false, nil)
 	if err != nil {
-		log.Fatalf("[Worker] Impossible de consommer la queue : %v", err)
+		wlog.Fatal().Err(err).Str("queue", "watermark_retry").Msg("impossible de consommer la queue")
 	}
 
 	optimizerURL := os.Getenv("OPTIMIZER_URL")
@@ -316,22 +321,19 @@ func retryWorker() {
 
 func processRetryJob(msg amqp.Delivery, optimizerURL string) {
 	start := time.Now()
-	log.Println("[Worker] ════════════════════════════════════════")
 
 	var job RetryJob
 	if err := json.Unmarshal(msg.Body, &job); err != nil {
-		log.Printf("[Worker] ❌ Message invalide : %v → ACK (élimination poison pill)", err)
-		log.Println("[Worker] ════════════════════════════════════════")
+		wlog.Error().Err(err).Msg("message invalide - poison pill éliminé")
 		msg.Ack(false)
 		return
 	}
-	log.Printf("[Worker] → Job reçu | hash=%s... | filename=%s", job.Hash[:16], job.Filename)
+	wlog.Info().Str("hash", job.Hash[:16]).Str("filename", job.Filename).Msg("job reçu")
 
 	// ── ① Récupérer l'original depuis MinIO ──────────────
 	data, err := fetchFromMinio(job.OriginalKey)
 	if err != nil {
-		log.Printf("[Worker] ① MinIO.Get  : ❌ %v → NACK (requeue dans 5s)", err)
-		log.Println("[Worker] ════════════════════════════════════════")
+		wlog.Error().Err(err).Str("step", "minio_get").Msg("minio KO - nack requeue dans 5s")
 		msg.Nack(false, true)
 		time.Sleep(5 * time.Second)
 		return
@@ -341,22 +343,20 @@ func processRetryJob(msg amqp.Delivery, optimizerURL string) {
 	t := time.Now()
 	result, err := sendToOptimizer(optimizerURL, job.Filename, data, job.WmText, job.WmPosition)
 	if err != nil {
-		log.Printf("[Worker] ② Optimizer  : ❌ Toujours KO : %v → NACK (requeue dans 10s)", err)
-		log.Println("[Worker] ════════════════════════════════════════")
+		wlog.Error().Err(err).Str("step", "optimizer").Msg("optimizer toujours KO - nack requeue dans 10s")
 		msg.Nack(false, true)
 		time.Sleep(10 * time.Second)
 		return
 	}
-	log.Printf("[Worker] ② Optimizer  : ✓ %s reçus | en %v", formatBytes(len(result)), time.Since(t))
+	wlog.Info().Str("step", "optimizer").Str("size", formatBytes(len(result))).Dur("duration", time.Since(t)).Msg("image optimisée")
 
 	// ── ③ Stocker dans Redis ──────────────────────────────
 	t = time.Now()
 	redisClient.Set(context.Background(), job.Hash, result, 24*time.Hour)
-	log.Printf("[Worker] ③ Redis.Set  : ✓ %s stockés | TTL 24h | en %v", formatBytes(len(result)), time.Since(t))
+	wlog.Info().Str("step", "redis_set").Str("size", formatBytes(len(result))).Dur("duration", time.Since(t)).Msg("résultat mis en cache")
 
 	msg.Ack(false)
-	log.Printf("[Worker] ✅ ACK envoyé | hash=%s... | ⏱ total %v", job.Hash[:16], time.Since(start))
-	log.Println("[Worker] ════════════════════════════════════════")
+	wlog.Info().Str("hash", job.Hash[:16]).Dur("duration", time.Since(start)).Msg("ack envoyé")
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -379,9 +379,9 @@ func saveOriginal(ctx context.Context, key string, data []byte) time.Duration {
 	//(t) c'est le temps de début de l'appel à PutObject, pas le temps de début du process, pour isoler le temps de stockage dans les logs.
 	dur := time.Since(t)
 	if err != nil {
-		log.Printf("[API] ④ MinIO.Put  : ⚠ Sauvegarde original échouée : %v", err)
+		logger.Error().Err(err).Str("step", "minio_put").Str("key", key).Msg("sauvegarde original échouée")
 	} else {
-		log.Printf("[API] ④ MinIO.Put  : ✓ Original sauvegardé | %s | en %v", formatBytes(len(data)), dur)
+		logger.Info().Str("step", "minio_put").Str("size", formatBytes(len(data))).Dur("duration", dur).Msg("original sauvegardé")
 	}
 	return dur
 }
@@ -398,7 +398,7 @@ func fetchFromMinio(key string) ([]byte, error) {
 	if err != nil || len(data) == 0 {
 		return nil, fmt.Errorf("lecture échouée ou fichier vide")
 	}
-	log.Printf("[Worker] ① MinIO.Get  : ✓ %s récupérés | en %v", formatBytes(len(data)), time.Since(t))
+	wlog.Info().Str("step", "minio_get").Str("size", formatBytes(len(data))).Dur("duration", time.Since(t)).Msg("original récupéré")
 	return data, nil
 }
 
@@ -416,10 +416,10 @@ func publishRetryJob(ctx context.Context, hash, originalKey, filename, wmText, w
 		},
 	)
 	if err != nil {
-		log.Printf("[API] ⑥ RabbitMQ   : ❌ Publish échoué : %v", err)
+		logger.Error().Err(err).Str("step", "rabbitmq_publish").Msg("publish échoué")
 		return err
 	}
-	log.Printf("[API] ⑥ RabbitMQ   : ✅ Job publié | queue=watermark_retry | persistent | en %v", time.Since(t))
+	logger.Info().Str("step", "rabbitmq_publish").Str("queue", "watermark_retry").Dur("duration", time.Since(t)).Msg("job publié")
 	return nil
 }
 
@@ -431,9 +431,8 @@ func replyWithRetryJob(w http.ResponseWriter, ctx context.Context, cacheKey, ori
 		return
 	}
 	w.Header().Set("X-T-Rabbit", fmtMs(time.Since(tRabbit)))
-	log.Printf("[API] ⑦ Réponse    : 202 Accepted | jobId=%s... | poll → /status/%s...", cacheKey[:16], cacheKey[:16])
-	log.Printf("[API] ⏱ Total      : %v", time.Since(start))
-	log.Println("[API] ════════════════════════════════════════")
+	logger.Info().Str("step", "response").Int("status", 202).Str("job_id", cacheKey[:16]).Msg("202 accepted")
+	logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Msg("requête terminée")
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)

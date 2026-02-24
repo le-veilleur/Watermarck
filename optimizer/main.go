@@ -8,13 +8,13 @@ import (
 	"image/draw"
 	"image/jpeg"
 	_ "image/png"
-	"log"
 	"net/http"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
@@ -48,19 +48,21 @@ var bufPool = sync.Pool{
 // opentype.Face est thread-safe en lecture.
 var fontFace font.Face
 
+// logger est le logger structuré partagé entre toutes les fonctions.
+var logger zerolog.Logger
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
+	zerolog.TimeFieldFormat = time.RFC3339
+	logger = zerolog.New(os.Stdout).With().Timestamp().Str("service", "optimizer").Logger()
+
 	numCPU := runtime.NumCPU()
-	log.Printf("[OPTIMIZER] Démarrage sur :3001")
-	log.Printf("[OPTIMIZER] ✓ Worker pool     : %d slots (= %d coeurs CPU détectés)", numCPU, numCPU)
-	log.Printf("[OPTIMIZER] ✓ sync.Pool       : buffers réutilisables initialisés")
+	logger.Info().Str("addr", ":3001").Int("worker_slots", numCPU).Msg("démarrage")
 
 	if err := loadFont(); err != nil {
-		log.Fatalf("[OPTIMIZER] ✗ Police : %v", err)
+		logger.Fatal().Err(err).Msg("chargement police échoué")
 	}
-	log.Printf("[OPTIMIZER] ✓ Police TTF      : chargée une fois en mémoire (pas de lecture disque par requête)")
-	log.Println("[OPTIMIZER] ─────────────────────────────────────────")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /optimize", handleOptimize)
@@ -72,18 +74,17 @@ func main() {
 
 func handleOptimize(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	log.Println("[OPTIMIZER] ┌─ Nouvelle image reçue")
 
 	// ── ① Worker Pool ────────────────────────────────────
 	// On log avant d'acquérir le slot pour tracer les pics de charge.
 	slotsUsed := len(sem) + 1
 	totalSlots := cap(sem)
-	log.Printf("[OPTIMIZER] │ ① Worker pool  : slot %d/%d occupé", slotsUsed, totalSlots)
+	logger.Info().Str("step", "worker_pool").Int("used", slotsUsed).Int("total", totalSlots).Msg("slot acquis")
 
 	sem <- struct{}{}
 	defer func() {
 		<-sem
-		log.Printf("[OPTIMIZER] │   Worker pool  : slot libéré (%d/%d utilisés)", len(sem), totalSlots)
+		logger.Info().Str("step", "worker_pool").Int("used", len(sem)).Int("total", totalSlots).Msg("slot libéré")
 	}()
 
 	// ── ② Décodage ───────────────────────────────────────
@@ -94,16 +95,16 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	origW, origH := img.Bounds().Dx(), img.Bounds().Dy()
-	log.Printf("[OPTIMIZER] │ ② Décodage     : format=%s | %dx%d | en %v", format, origW, origH, time.Since(t))
+	logger.Info().Str("step", "decode").Str("format", format).Int("width", origW).Int("height", origH).Dur("duration", time.Since(t)).Msg("décodage")
 
 	// ── ③ Resize ─────────────────────────────────────────
 	t = time.Now()
 	resized := resize(img)
 	newW, newH := resized.Bounds().Dx(), resized.Bounds().Dy()
 	if origW == newW && origH == newH {
-		log.Printf("[OPTIMIZER] │ ③ Resize       : aucun (déjà dans les limites %dx%d)", maxWidth, maxHeight)
+		logger.Info().Str("step", "resize").Bool("resized", false).Int("max_w", maxWidth).Int("max_h", maxHeight).Msg("resize ignoré")
 	} else {
-		log.Printf("[OPTIMIZER] │ ③ Resize       : %dx%d → %dx%d | BiLinear | en %v", origW, origH, newW, newH, time.Since(t))
+		logger.Info().Str("step", "resize").Bool("resized", true).Int("from_w", origW).Int("from_h", origH).Int("to_w", newW).Int("to_h", newH).Dur("duration", time.Since(t)).Msg("resize")
 	}
 
 	// ── ④ Watermark ──────────────────────────────────────
@@ -114,7 +115,7 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Erreur watermark", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[OPTIMIZER] │ ④ Watermark    : \"%s\" @ %s | police en mémoire | en %v", wmText, wmPosition, time.Since(t))
+	logger.Info().Str("step", "watermark").Str("text", wmText).Str("position", wmPosition).Dur("duration", time.Since(t)).Msg("watermark appliqué")
 
 	// ── ⑤ Encodage JPEG ──────────────────────────────────
 	t = time.Now()
@@ -124,8 +125,8 @@ func handleOptimize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer bufPool.Put(buf)
-	log.Printf("[OPTIMIZER] │ ⑤ JPEG encode  : qualité=%d%% | %s | en %v", quality, formatBytes(buf.Len()), time.Since(t))
-	log.Printf("[OPTIMIZER] └─ ⏱ Total       : %v", time.Since(start))
+	logger.Info().Str("step", "encode").Int("quality", quality).Str("size", formatBytes(buf.Len())).Dur("duration", time.Since(t)).Msg("encodage JPEG")
+	logger.Info().Str("step", "total").Dur("duration", time.Since(start)).Msg("image traitée")
 
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Write(buf.Bytes())
@@ -169,7 +170,7 @@ func wmParams(r *http.Request) (text, position string) {
 func encodeToBuffer(img image.Image) (*bytes.Buffer, error) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	log.Printf("[OPTIMIZER] │   sync.Pool    : buffer récupéré (recyclé, pas d'allocation)")
+	logger.Debug().Str("step", "pool").Msg("buffer récupéré depuis sync.Pool")
 	if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: quality}); err != nil {
 		bufPool.Put(buf) // on remet le buffer même en cas d'erreur
 		return nil, err
@@ -229,16 +230,16 @@ func wmCoords(textWidth, w, h int, position string) (x, y int) {
 // sur n'importe quelle image (claire ou sombre).
 func adaptiveColor(img image.Image, x, y int) color.RGBA {
 	avg := sampleLuminance(img, x, y)
-	log.Printf("[OPTIMIZER] │   Watermark    : luminosité zone=%.1f/255 → ", avg)
+	darkBg := avg <= 128
 
 	// Seuil 128 = mi-chemin entre noir (0) et blanc (255).
 	// En dessous : fond sombre → texte blanc. Au-dessus : fond clair → texte sombre.
-	if avg > 128 {
-		log.Printf("[OPTIMIZER] │                  fond CLAIR → texte sombre")
-		return color.RGBA{R: 30, G: 30, B: 30, A: 210}
+	logger.Debug().Str("step", "adaptive_color").Float64("luminance", avg).Bool("dark_bg", darkBg).Msg("couleur adaptative")
+
+	if darkBg {
+		return color.RGBA{R: 255, G: 255, B: 255, A: 210}
 	}
-	log.Printf("[OPTIMIZER] │                  fond SOMBRE → texte blanc")
-	return color.RGBA{R: 255, G: 255, B: 255, A: 210}
+	return color.RGBA{R: 30, G: 30, B: 30, A: 210}
 }
 
 // sampleLuminance calcule la luminance perceptuelle moyenne d'une zone de sampleW×sampleH px
@@ -338,7 +339,7 @@ func loadFont() error {
 		DPI:  72,
 	})
 
-	log.Printf("[OPTIMIZER] ✓ Police chargée en %v (%s)", time.Since(t), formatBytes(len(fontBytes)))
+	logger.Info().Str("component", "init").Str("path", fontPath).Str("size", formatBytes(len(fontBytes))).Dur("duration", time.Since(t)).Msg("police chargée")
 	return err
 }
 
