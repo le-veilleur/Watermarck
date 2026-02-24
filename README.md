@@ -12,6 +12,11 @@
 | [📄 IOPIPE.md](./IOPIPE.md) | io.Pipe, protocole ping-pong, channels, goroutines, streaming sans buffer |
 | [📄 GZIP.md](./GZIP.md) | Compression gzip, LZ77, Huffman, format fichier, niveaux, HTTP Content-Encoding |
 | [📄 ROADMAP.md](./ROADMAP.md) | Roadmap complète : observabilité, résilience, cache, HTTP/2, chaos, scaling, OS |
+| [📄 LOGGING.md](./LOGGING.md) | Structured logging, zerolog, zap, slog, JSON fields, sampling, request_id, Loki |
+| [📄 RESILIENCE.md](./RESILIENCE.md) | Circuit Breaker, rate limiting, backoff+jitter, context, health checks, graceful shutdown |
+| [📄 IMAGE.md](./IMAGE.md) | Formats (WebP/AVIF), algorithmes de resize, traitement parallèle, EXIF, libjpeg-turbo |
+| [📄 DISTRIBUTED.md](./DISTRIBUTED.md) | CAP theorem, load balancing, DLQ, consistent hashing, CQRS, event sourcing |
+| [📄 LINUX.md](./LINUX.md) | epoll, io_uring, sendfile/zero-copy, mmap, cache CPU, NUMA, Docker FROM scratch |
 
 ---
 
