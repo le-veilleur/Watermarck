@@ -11,6 +11,7 @@
 | [📄 RABBITMQ.md](./RABBITMQ.md) | Exchanges, Queues, ACK, DLQ, Publisher Confirms, Option B implémentée |
 | [📄 IOPIPE.md](./IOPIPE.md) | io.Pipe, protocole ping-pong, channels, goroutines, streaming sans buffer |
 | [📄 GZIP.md](./GZIP.md) | Compression gzip, LZ77, Huffman, format fichier, niveaux, HTTP Content-Encoding |
+| [📄 ROADMAP.md](./ROADMAP.md) | Roadmap complète : observabilité, résilience, cache, HTTP/2, chaos, scaling, OS |
 
 ---
 
