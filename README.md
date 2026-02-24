@@ -3,6 +3,15 @@
 
 ---
 
+## 🗂️ Autres cours
+
+| Document | Contenu |
+|----------|---------|
+| [📄 REDIS.md](./REDIS.md) | Structures de données, cache, Pub/Sub, persistance, Cluster |
+| [📄 RABBITMQ.md](./RABBITMQ.md) | Exchanges, Queues, ACK, DLQ, Publisher Confirms |
+
+---
+
 ## 📋 Table des matières
 
 1. [Architecture du projet](#architecture)
