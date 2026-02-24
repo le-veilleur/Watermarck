@@ -84,7 +84,7 @@ Service A ──► RabbitMQ ──► Service B
 ## 2. Les concepts fondamentaux
 
 ```
-┌─────────────┐    publish     ┌──────────┐   route   ┌───────────┐
+┌─────────────┐    publish     ┌──────────┐   route    ┌───────────┐
 │  Producteur │ ─────────────► │ Exchange │ ─────────► │   Queue   │
 │ (Publisher) │                └──────────┘            └─────┬─────┘
 └─────────────┘                                              │ consume
@@ -134,6 +134,18 @@ L'exchange est le **chef d'orchestre** : il reçoit chaque message du producteur
 
 Il existe 4 types d'exchanges.
 
+> Les exemples utilisent `github.com/rabbitmq/amqp091-go`, le client officiel Go pour RabbitMQ.
+
+```go
+import amqp "github.com/rabbitmq/amqp091-go"
+
+conn, _ := amqp.Dial("amqp://guest:guest@localhost:5672/")
+defer conn.Close()
+
+ch, _ := conn.Channel()
+defer ch.Close()
+```
+
 ---
 
 ### 3a. Direct Exchange
@@ -159,16 +171,20 @@ Producteur envoie routing_key="order.paid"
 
 **Use case :** Traitement de tâches spécifiques par type.
 
-```python
-# Producteur
-channel.basic_publish(
-    exchange='orders',
-    routing_key='order.paid',  # clé exacte
-    body=json.dumps(order)
-)
+```go
+// Déclarer l'exchange
+ch.ExchangeDeclare("orders", "direct", true, false, false, false, nil)
 
-# Consommateur (lié à la routing key "order.paid")
-channel.queue_bind(queue='payment', exchange='orders', routing_key='order.paid')
+// Binding : queue "payment" reçoit les messages "order.paid"
+ch.QueueDeclare("payment", true, false, false, false, nil)
+ch.QueueBind("payment", "order.paid", "orders", false, nil)
+
+// Producteur : publier avec routing key exacte
+body, _ := json.Marshal(order)
+ch.Publish("orders", "order.paid", false, false, amqp.Publishing{
+    ContentType: "application/json",
+    Body:        body,
+})
 ```
 
 ---
@@ -194,13 +210,14 @@ Producteur envoie un message
 
 **Use case :** Notifications broadcast — un événement doit déclencher plusieurs actions en parallèle.
 
-```python
-# Producteur (routing_key ignorée)
-channel.basic_publish(
-    exchange='notifications',
-    routing_key='',  # ignoré en fanout
-    body=json.dumps(event)
-)
+```go
+ch.ExchangeDeclare("notifications", "fanout", true, false, false, false, nil)
+
+// Routing key ignorée en fanout — on passe une chaîne vide
+ch.Publish("notifications", "", false, false, amqp.Publishing{
+    ContentType: "application/json",
+    Body:        body,
+})
 ```
 
 **Exemple :** Un utilisateur s'inscrit → envoyer un email de bienvenue + créer un log + mettre à jour les stats, tout en même temps.
@@ -248,10 +265,18 @@ Bindings :
 
 **Use case :** Logging centralisé avec filtrage par niveau et service.
 
-```python
-channel.queue_bind(queue='alertes',    exchange='logs', routing_key='log.error.*')
-channel.queue_bind(queue='tous_logs',  exchange='logs', routing_key='log.#')
-channel.queue_bind(queue='warns',      exchange='logs', routing_key='*.warn.*')
+```go
+ch.ExchangeDeclare("logs", "topic", true, false, false, false, nil)
+
+ch.QueueBind("alertes",   "log.error.*", "logs", false, nil)
+ch.QueueBind("tous_logs", "log.#",       "logs", false, nil)
+ch.QueueBind("warns",     "*.warn.*",    "logs", false, nil)
+
+// Publier un log d'erreur
+ch.Publish("logs", "log.error.database", false, false, amqp.Publishing{
+    Body: []byte(`{"msg":"connexion DB perdue"}`),
+})
+// → reçu par "alertes" et "tous_logs", pas par "warns"
 ```
 
 ---
@@ -260,23 +285,22 @@ channel.queue_bind(queue='warns',      exchange='logs', routing_key='*.warn.*')
 
 **Règle :** Routage basé sur les **headers du message** (pas la routing key).
 
-```python
-# Producteur
-channel.basic_publish(
-    exchange='reports',
-    routing_key='',  # ignoré
-    properties=pika.BasicProperties(headers={'format': 'pdf', 'region': 'eu'}),
-    body=report_data
-)
+```go
+ch.ExchangeDeclare("reports", "headers", true, false, false, false, nil)
 
-# Binding : queue "pdf-eu" reçoit si format=pdf ET region=eu
-channel.queue_bind(
-    queue='pdf-eu',
-    exchange='reports',
-    arguments={'x-match': 'all', 'format': 'pdf', 'region': 'eu'}
-    # x-match: 'all' = tous les headers doivent correspondre
-    # x-match: 'any' = au moins un header doit correspondre
-)
+// Binding : queue "pdf-eu" reçoit si format=pdf ET region=eu
+ch.QueueBind("pdf-eu", "", "reports", false, amqp.Table{
+    "x-match": "all",   // "all" = tous les headers doivent correspondre
+    "format":  "pdf",   // "any" = au moins un
+    "region":  "eu",
+})
+
+// Producteur
+ch.Publish("reports", "", false, false, amqp.Publishing{
+    Headers:     amqp.Table{"format": "pdf", "region": "eu"},
+    ContentType: "application/octet-stream",
+    Body:        reportData,
+})
 ```
 
 **Use case :** Routage complexe basé sur plusieurs critères métier.
@@ -315,12 +339,14 @@ Queue "orders" :
 
 ### Déclarer une queue
 
-```python
-channel.queue_declare(
-    queue='orders',
-    durable=True,      # survit au redémarrage de RabbitMQ
-    exclusive=False,   # partagée entre plusieurs connexions
-    auto_delete=False  # ne se supprime pas quand plus aucun consommateur
+```go
+q, err := ch.QueueDeclare(
+    "orders", // nom
+    true,     // durable : survit au redémarrage de RabbitMQ
+    false,    // auto-delete : supprime si plus aucun consommateur
+    false,    // exclusive : réservée à cette connexion uniquement
+    false,    // no-wait
+    nil,      // arguments
 )
 ```
 
@@ -337,7 +363,7 @@ Consommateur A ──► reçoit M1, M3, M5
 Consommateur B ──► reçoit M2, M4, M6
 ```
 
-**C'est le mécanisme de scalabilité horizontal :** pour traiter plus vite, on ajoute des consommateurs.
+**C'est le mécanisme de scalabilité horizontale :** pour traiter plus vite, on ajoute des consommateurs.
 
 ---
 
@@ -346,11 +372,13 @@ Consommateur B ──► reçoit M2, M4, M6
 
 Un binding est la **règle** qui relie un exchange à une queue. Sans binding, les messages arrivent dans l'exchange mais ne vont nulle part.
 
-```python
-channel.queue_bind(
-    queue='payment-service',
-    exchange='orders',
-    routing_key='order.paid'
+```go
+err := ch.QueueBind(
+    "payment-service", // queue
+    "order.paid",      // routing key
+    "orders",          // exchange
+    false,
+    nil,
 )
 ```
 
@@ -379,44 +407,48 @@ Le message reste dans la queue jusqu'à ce que le consommateur envoie un ACK.
 Queue ──► Consommateur
           │ traitement...
           │ traitement...
-          ├── succès → channel.basic_ack()   → message supprimé de la queue ✅
-          └── échec  → channel.basic_nack()  → message remis dans la queue 🔄
+          ├── succès → ch.Ack()   → message supprimé de la queue ✅
+          └── échec  → ch.Nack()  → message remis dans la queue 🔄
 ```
 
-```python
-def callback(ch, method, properties, body):
-    try:
-        process_order(json.loads(body))
-        ch.basic_ack(delivery_tag=method.delivery_tag)   # ✅ OK, supprime le message
-    except Exception as e:
-        ch.basic_nack(
-            delivery_tag=method.delivery_tag,
-            requeue=True   # 🔄 remet dans la queue pour réessayer
-        )
+```go
+msgs, _ := ch.Consume(
+    "orders", // queue
+    "",       // consumer tag
+    false,    // auto-ack : false = ACK manuel ✅
+    false, false, false, nil,
+)
 
-channel.basic_consume(queue='orders', on_message_callback=callback)
+for msg := range msgs {
+    err := processOrder(msg.Body)
+    if err == nil {
+        msg.Ack(false)             // ✅ succès → supprime le message
+    } else {
+        msg.Nack(false, true)      // ❌ échec → requeue=true : remet dans la queue
+    }
+}
 ```
 
 ---
 
 ### Les 3 réponses possibles
 
-| Réponse | Méthode | Effet |
-|---------|---------|-------|
-| Succès | `basic_ack` | Message supprimé de la queue |
-| Échec + retry | `basic_nack(requeue=True)` | Message remis en tête de queue |
-| Échec définitif | `basic_nack(requeue=False)` | Message envoyé en Dead Letter Queue |
+| Réponse | Méthode Go | Effet |
+|---------|------------|-------|
+| Succès | `msg.Ack(false)` | Message supprimé de la queue |
+| Échec + retry | `msg.Nack(false, true)` | Message remis en tête de queue |
+| Échec définitif | `msg.Nack(false, false)` | Message envoyé en Dead Letter Queue |
 
 ---
 
 ### Auto-ACK vs Manuel
 
-```python
-# ❌ Auto-ACK : message supprimé dès réception (dangereux)
-channel.basic_consume(queue='orders', on_message_callback=callback, auto_ack=True)
+```go
+// ❌ Auto-ACK : message supprimé dès réception (dangereux)
+ch.Consume("orders", "", true, false, false, false, nil)
 
-# ✅ ACK manuel : message supprimé seulement après traitement réussi
-channel.basic_consume(queue='orders', on_message_callback=callback, auto_ack=False)
+// ✅ ACK manuel : message supprimé seulement après traitement réussi
+ch.Consume("orders", "", false, false, false, false, nil)
 ```
 
 **Toujours utiliser l'ACK manuel pour les tâches critiques.**
@@ -428,7 +460,7 @@ channel.basic_consume(queue='orders', on_message_callback=callback, auto_ack=Fal
 
 ### 🎯 Le problème
 
-Par défaut, `basic_publish` ne confirme pas que le message a bien été reçu par RabbitMQ. En cas de réseau instable, le message peut être perdu **avant même d'entrer dans la queue**.
+Par défaut, `Publish` ne confirme pas que le message a bien été reçu par RabbitMQ. En cas de réseau instable, le message peut être perdu **avant même d'entrer dans la queue**.
 
 ---
 
@@ -436,22 +468,29 @@ Par défaut, `basic_publish` ne confirme pas que le message a bien été reçu p
 
 RabbitMQ envoie un ACK/NACK au **producteur** pour confirmer la réception.
 
-```python
-# Activer les confirms
-channel.confirm_delivery()
+```go
+// Activer le mode confirms
+if err := ch.Confirm(false); err != nil {
+    log.Fatal("Impossible d'activer les confirms")
+}
 
-try:
-    channel.basic_publish(
-        exchange='orders',
-        routing_key='order.paid',
-        body=json.dumps(order),
-        mandatory=True  # erreur si aucune queue n'est liée
-    )
-    print("✅ Message confirmé par RabbitMQ")
-except pika.exceptions.UnroutableError:
-    print("❌ Message non routable (aucune queue liée)")
-except pika.exceptions.NackError:
-    print("❌ RabbitMQ a refusé le message")
+// Canal de confirmation
+confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+body, _ := json.Marshal(order)
+ch.Publish("orders", "order.paid", true, false, amqp.Publishing{
+    DeliveryMode: amqp.Persistent,
+    ContentType:  "application/json",
+    Body:         body,
+})
+
+// Attendre la confirmation de RabbitMQ
+confirm := <-confirms
+if confirm.Ack {
+    log.Println("✅ Message confirmé par RabbitMQ")
+} else {
+    log.Println("❌ RabbitMQ a refusé le message (NACK)")
+}
 ```
 
 ---
@@ -486,7 +525,7 @@ Après N échecs, le message est envoyé dans une queue spéciale pour analyse.
 ```
 Queue normale ──► Consommateur
                   │
-                  └── NACK (requeue=False)
+                  └── Nack(requeue=false)
                             │
                             ▼
                   ┌─────────────────┐
@@ -498,35 +537,27 @@ Queue normale ──► Consommateur
                   Analyse / alerte / replay manuel
 ```
 
-**Configuration :**
+```go
+// Déclarer la DLQ
+ch.QueueDeclare("orders.dlq", true, false, false, false, nil)
 
-```python
-# Déclarer la DLQ
-channel.queue_declare(queue='orders.dlq', durable=True)
+// Déclarer la queue normale avec redirection vers la DLQ
+ch.QueueDeclare("orders", true, false, false, false, amqp.Table{
+    "x-dead-letter-exchange":    "",            // exchange par défaut
+    "x-dead-letter-routing-key": "orders.dlq", // queue de destination
+    "x-message-ttl":             int32(30000),  // expire après 30s
+    "x-max-length":              int32(10000),  // max 10 000 messages
+})
 
-# Déclarer la queue normale avec redirection vers la DLQ
-channel.queue_declare(
-    queue='orders',
-    durable=True,
-    arguments={
-        'x-dead-letter-exchange': '',       # exchange par défaut
-        'x-dead-letter-routing-key': 'orders.dlq',  # queue de destination
-        'x-message-ttl': 30000,             # TTL optionnel : expire après 30s
-        'x-max-length': 10000               # max 10 000 messages dans la queue
+// Dans le consommateur
+for msg := range msgs {
+    if err := processOrder(msg.Body); err != nil {
+        // requeue=false → part automatiquement en DLQ
+        msg.Nack(false, false)
+    } else {
+        msg.Ack(false)
     }
-)
-```
-
-**Dans le consommateur :**
-
-```python
-def callback(ch, method, properties, body):
-    try:
-        process_order(json.loads(body))
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception:
-        # requeue=False → part en DLQ
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+}
 ```
 
 ---
@@ -557,31 +588,30 @@ Par défaut, si RabbitMQ redémarre, **toutes les queues et messages en mémoire
 
 #### Niveau 1 : Queue durable
 
-La queue **survit au redémarrage** de RabbitMQ (la définition est sauvegardée).
+La queue **survit au redémarrage** de RabbitMQ (la définition est sauvegardée sur disque).
 
-```python
-channel.queue_declare(queue='orders', durable=True)  # ✅ queue persistante
+```go
+ch.QueueDeclare("orders", true, false, false, false, nil)
+//                         ^^^^
+//                         durable = true ✅
 ```
 
 #### Niveau 2 : Message persistant
 
 Les messages sont **écrits sur disque** (pas seulement en RAM).
 
-```python
-channel.basic_publish(
-    exchange='orders',
-    routing_key='order.paid',
-    body=json.dumps(order),
-    properties=pika.BasicProperties(
-        delivery_mode=2  # 1 = RAM seulement, 2 = disque (persistant)
-    )
-)
+```go
+ch.Publish("orders", "order.paid", false, false, amqp.Publishing{
+    DeliveryMode: amqp.Persistent, // 1 = RAM, 2 (Persistent) = disque ✅
+    ContentType:  "application/json",
+    Body:         body,
+})
 ```
 
 #### Niveau 3 : Queue durable + Message persistant = Zéro perte
 
 ```
-Queue durable + delivery_mode=2
+Queue durable + DeliveryMode=Persistent
 → Si RabbitMQ crashe et redémarre :
   → La queue est recréée ✅
   → Les messages sont relus depuis le disque ✅
@@ -594,9 +624,9 @@ Queue durable + delivery_mode=2
 
 | Queue | Message | Survit au redémarrage | Performance |
 |-------|---------|----------------------|-------------|
-| Non durable | `delivery_mode=1` | ❌ Tout perdu | Maximum |
-| Durable | `delivery_mode=1` | Queue OK, messages perdus | Bonne |
-| Durable | `delivery_mode=2` | ✅ Tout survit | Plus lente |
+| Non durable | Transient | ❌ Tout perdu | Maximum |
+| Durable | Transient | Queue OK, messages perdus | Bonne |
+| Durable | Persistent | ✅ Tout survit | Plus lente |
 
 ---
 
@@ -622,9 +652,13 @@ Consommateur B (lent)   ──► reçoit M501...M1000 en mémoire, traite M501
 
 On limite le nombre de messages non-ACKés qu'un consommateur peut avoir en même temps.
 
-```python
-channel.basic_qos(prefetch_count=1)
-# RabbitMQ n'envoie le message suivant qu'après réception de l'ACK du précédent
+```go
+// RabbitMQ n'envoie le message suivant qu'après réception de l'ACK du précédent
+ch.Qos(
+    1,     // prefetch count
+    0,     // prefetch size (0 = illimité)
+    false, // global (false = par consommateur)
+)
 ```
 
 ```
@@ -632,12 +666,12 @@ Queue : [M1, M2, M3, M4, M5, M6]
 prefetch_count=1
 
 Consommateur A (rapide) :
-  → reçoit M1 → traite (rapide) → ACK → reçoit M3 → traite → ACK → reçoit M5...
+  → reçoit M1 → traite (rapide) → Ack → reçoit M3 → traite → Ack → reçoit M5...
 
 Consommateur B (lent) :
-  → reçoit M2 → traite (lent)... → ACK → reçoit M4 → traite...
+  → reçoit M2 → traite (lent)... → Ack → reçoit M4 → traite...
 
-Résultat : A fait plus de travail car il ACK plus vite ✅
+Résultat : A fait plus de travail car il Ack plus vite ✅
 ```
 
 ---
@@ -651,12 +685,12 @@ Résultat : A fait plus de travail car il ACK plus vite ✅
 | `10-50` | Buffer raisonnable | Tâches rapides |
 | `100+` | Gros buffer | Tâches très rapides, haut débit |
 
-```python
-# Tâche lourde (traitement image, ML...) → 1
-channel.basic_qos(prefetch_count=1)
+```go
+// Tâche lourde (traitement image, ML...) → 1
+ch.Qos(1, 0, false)
 
-# Tâche légère (log, email...) → 10-50
-channel.basic_qos(prefetch_count=20)
+// Tâche légère (log, email...) → 20
+ch.Qos(20, 0, false)
 ```
 
 ---
@@ -668,7 +702,7 @@ channel.basic_qos(prefetch_count=20)
 
 ```
 Direct  → 1 routing key exacte  → 1 queue
-Fanout  → ignores routing key   → toutes les queues
+Fanout  → ignore routing key    → toutes les queues
 Topic   → pattern "log.*.error" → queues filtrées
 Headers → attributs du message  → queues filtrées
 ```
@@ -687,6 +721,67 @@ Headers → attributs du message  → queues filtrées
 
 ---
 
+### Exemple complet en Go
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "log"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+func main() {
+    conn, _ := amqp.Dial("amqp://guest:guest@localhost:5672/")
+    defer conn.Close()
+    ch, _ := conn.Channel()
+    defer ch.Close()
+
+    // Exchange topic
+    ch.ExchangeDeclare("orders", "topic", true, false, false, false, nil)
+
+    // Queues
+    ch.QueueDeclare("payment",   true, false, false, false, amqp.Table{
+        "x-dead-letter-exchange":    "",
+        "x-dead-letter-routing-key": "payment.dlq",
+    })
+    ch.QueueDeclare("analytics", true, false, false, false, nil)
+    ch.QueueDeclare("payment.dlq", true, false, false, false, nil)
+
+    // Bindings
+    ch.QueueBind("payment",   "order.paid", "orders", false, nil)
+    ch.QueueBind("analytics", "order.#",    "orders", false, nil)
+
+    // Prefetch
+    ch.Qos(5, 0, false)
+
+    // Consommateur
+    msgs, _ := ch.Consume("payment", "", false, false, false, false, nil)
+
+    for msg := range msgs {
+        var order map[string]any
+        json.Unmarshal(msg.Body, &order)
+
+        if err := processPayment(order); err != nil {
+            log.Printf("❌ Échec : %v → DLQ", err)
+            msg.Nack(false, false) // → part en DLQ
+        } else {
+            log.Printf("✅ Paiement traité")
+            msg.Ack(false)
+        }
+    }
+}
+
+func processPayment(order map[string]any) error {
+    // traitement...
+    return nil
+}
+```
+
+---
+
 ### Architecture complète
 
 ```
@@ -694,7 +789,7 @@ Headers → attributs du message  → queues filtrées
 │  Producteur  │
 │  (API REST)  │
 └──────┬───────┘
-       │ publish("order.paid")
+       │ Publish("order.paid")
        ▼
 ┌──────────────┐
 │   Exchange   │ type: topic
@@ -715,7 +810,7 @@ Headers → attributs du message  → queues filtrées
 ┌──────────┐     ┌──────────┐
 │ Worker 1 │     │ Worker 2 │   ← scalabilité horizontale
 └──────────┘     └──────────┘
-       │ NACK (échec)
+       │ Nack (échec)
        ▼
 ┌──────────────┐
 │ payment.dlq  │  ← Dead Letter Queue
@@ -729,14 +824,14 @@ Headers → attributs du message  → queues filtrées
 #### 1. **Découplage**
 Le producteur ne connaît pas les consommateurs. Il publie dans un exchange, c'est tout.
 
-#### 2. **Durabilité = Queue durable + delivery_mode=2**
+#### 2. **Durabilité = Queue durable + DeliveryMode Persistent**
 Sans ces deux options, les messages peuvent être perdus au redémarrage.
 
 #### 3. **ACK manuel toujours**
-Ne jamais utiliser `auto_ack=True` pour des tâches critiques. Le message doit rester en queue jusqu'à confirmation du traitement.
+Ne jamais utiliser `auto_ack=true`. Le message doit rester en queue jusqu'à confirmation du traitement.
 
 #### 4. **Prefetch = protection contre la surcharge**
-Sans `basic_qos`, un consommateur lent peut recevoir tous les messages et les bloquer.
+Sans `ch.Qos()`, un consommateur lent peut recevoir tous les messages et les bloquer.
 
 #### 5. **DLQ = filet de sécurité**
 Les messages qui échouent répétitivement doivent aller en DLQ pour analyse, pas boucler indéfiniment.
@@ -746,6 +841,7 @@ Les messages qui échouent répétitivement doivent aller en DLQ pour analyse, p
 ## 📚 Pour aller plus loin
 
 - **Management UI** : `http://localhost:15672` (guest/guest) — visualiser queues, exchanges, messages en temps réel
+- **`github.com/rabbitmq/amqp091-go`** : client officiel Go
 - **Shovel plugin** : transférer des messages entre brokers
 - **Federation plugin** : distribuer RabbitMQ sur plusieurs datacenters
 - **Quorum Queues** : remplacement des mirrored queues pour la haute disponibilité
