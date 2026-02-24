@@ -23,27 +23,38 @@ import (
 // Ce microservice API reçoit une image, vérifie si une version optimisée existe déjà dans Redis (cache), sinon il la forward à l'optimizer, stocke le résultat dans Redis et MinIO, puis renvoie l'image optimisée au client. Il utilise un http.Client partagé avec timeout et keep-alive pour les requêtes vers l'optimizer, et logue chaque étape du processus.
 const minioBucket = "watermarks"
 
+// httpClient global avec timeout et keep-alive => (maintenir une connection ouverte ) activé pour les requêtes vers l'optimizer. Cela permet de réutiliser les connexions TCP et d'améliorer les performances lors de l'envoi de plusieurs requêtes à l'optimizer.
 var httpClient = &http.Client{
+	// En configurant un timeout, on évite que les requêtes vers l'optimizer restent bloquées indéfiniment en cas de problème. Un timeout de 30 secondes est un compromis raisonnable pour permettre à l'optimizer de traiter des images plus grandes tout en évitant des délais d'attente excessifs.
 	Timeout: 30 * time.Second,
 }
 
+// Redis client global pour éviter de le recréer à chaque requête. En initialisant le client Redis une seule fois au démarrage de l'application, on évite la surcharge de créer une nouvelle connexion à Redis pour chaque requête entrante, ce qui améliore les performances et réduit la latence.
 var redisClient *redis.Client
 // MinIO client global pour éviter de le recréer à chaque requête
 var minioClient *minio.Client
 
 func main() {
+	// ── Initialisation Redis ───────────────────────────────
+	// L'URL de Redis est récupérée depuis les variables d'environnement, avec une valeur par défaut pour faciliter le développement local. En production, il est recommandé de configurer l'URL de Redis via les variables d'environnement pour une meilleure flexibilité et sécurité.
 	redisURL := os.Getenv("REDIS_URL")
+	// Si REDIS_URL n'est pas défini, on utilise redis://localhost:6379, qui est l'URL par défaut de Redis en local. Cela permet de lancer l'application en local sans configuration supplémentaire, tout en encourageant la configuration via les variables d'environnement en production.
 	if redisURL == "" {
+		// En développement local, on suppose que Redis tourne sur localhost:6379
 		redisURL = "redis://localhost:6379"
 	}
 
+	// On parse l'URL de Redis pour obtenir les options de connexion. Si l'URL est invalide, on logue une erreur critique et on arrête le programme, car la connexion à Redis est essentielle pour le fonctionnement de l'API.
 	opt, err := redis.ParseURL(redisURL)
+	// Si l'URL de Redis est invalide, on logue une erreur critique et on arrête le programme, car la connexion à Redis est essentielle pour le fonctionnement de l'API.
 	if err != nil {
 		log.Fatalf("[API] Redis URL invalide : %v", err)
 	}
 
+	//Création du client Redis avec les options de connexion. En initialisant le client Redis une seule fois au démarrage de l'application, on évite la surcharge de créer une nouvelle connexion à Redis pour chaque requête entrante, ce qui améliore les performances et réduit la latence.
 	redisClient = redis.NewClient(opt)
 
+	// Vérification de la connexion à Redis en envoyant une commande PING. Si la connexion échoue, on logue une erreur critique et on arrête le programme, car l'accès à Redis est essentiel pour le fonctionnement de l'API.
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
 		log.Fatalf("[API] Impossible de se connecter à Redis : %v", err)
 	}
@@ -161,6 +172,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API] ③ Redis      : ✅ CACHE HIT  | %s récupérés en %v", formatBytes(len(cached)), redisDuration)
 		log.Printf("[API] ⚡ Total      : %v (sans passer par l'optimizer !)", time.Since(start))
 		log.Println("[API] ════════════════════════════════════════")
+		w.Header().Set("X-Cache", "HIT")
 		sendResponse(w, r, cached)
 		return
 	}
@@ -321,6 +333,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Cache")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
