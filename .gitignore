@@ -5,3 +5,4 @@ optimizer/images/
 *.exe
 .env
 .claude
+secrets/
