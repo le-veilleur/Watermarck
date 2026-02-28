@@ -17,6 +17,7 @@
 | [📄 IMAGE.md](./IMAGE.md) | Formats (WebP/AVIF), algorithmes de resize, traitement parallèle, EXIF, libjpeg-turbo |
 | [📄 DISTRIBUTED.md](./DISTRIBUTED.md) | CAP theorem, load balancing, DLQ, consistent hashing, CQRS, event sourcing |
 | [📄 LINUX.md](./LINUX.md) | epoll, io_uring, sendfile/zero-copy, mmap, cache CPU, NUMA, Docker FROM scratch |
+| [📄 CACHE-CONTROL.md](./CACHE-CONTROL.md) | Cache-Control, directives, ETag, Last-Modified, Vary, stratégie par endpoint, net/http |
 
 ---
 
