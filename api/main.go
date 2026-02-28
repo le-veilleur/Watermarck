@@ -25,12 +25,12 @@ func main() {
 	zerolog.TimeFieldFormat = time.RFC3339                                             // RFC3339 est plus lisible que l'epoch dans les logs structurés
 	logger = zerolog.New(os.Stdout).With().Timestamp().Str("service", "api").Logger() // champ "service" identifie ce service dans une stack multi-conteneurs
 
-	logger.Info().Str("addr", ":3000").Msg("démarrage")
+	logger.Info().Str("addr", ":4000").Msg("démarrage")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /upload", handleUpload) // point d'entrée principal : upload + watermark
 
-	http.ListenAndServe(":3000", corsMiddleware(mux)) //nolint:errcheck — erreur fatale, le conteneur redémarre
+	http.ListenAndServe(":4000", corsMiddleware(mux)) //nolint:errcheck — erreur fatale, le conteneur redémarre
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

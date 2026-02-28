@@ -1,27 +1,20 @@
-# ── API ──────────────────────────────────────────────────────────────────────
+FROM golang:1.26.0-alpine3.23 AS build
 
-FROM golang:1.26-alpine AS build-api
-WORKDIR /usr/src/api
-COPY api/go.mod api/go.sum ./
+ARG SERVICE_DIR
+ARG CMD_PATH
+
+WORKDIR /usr/src/${SERVICE_DIR}
+
+COPY ${SERVICE_DIR}/go.mod ${SERVICE_DIR}/go.sum ./
+
 RUN go mod download
-COPY api/ .
-RUN CGO_ENABLED=0 go build -o /usr/local/bin/api .
+COPY ${SERVICE_DIR}/ .
 
-FROM scratch AS api
-COPY --from=build-api /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build-api /usr/local/bin/api /usr/local/bin/api
-CMD ["/usr/local/bin/api"]
+RUN CGO_ENABLED=0 go build -o /usr/local/bin/service .
 
-# ── Optimizer ─────────────────────────────────────────────────────────────────
+FROM scratch
 
-FROM golang:1.26-alpine AS build-optimizer
-WORKDIR /usr/src/optimizer
-COPY optimizer/go.mod optimizer/go.sum ./
-RUN go mod download
-COPY optimizer/ .
-RUN CGO_ENABLED=0 go build -o /usr/local/bin/optimizer .
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /usr/local/bin/service /usr/local/bin/service
 
-FROM scratch AS optimizer
-COPY --from=build-optimizer /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build-optimizer /usr/local/bin/optimizer /optimizer
-CMD ["/optimizer"]
+CMD ["/usr/local/bin/service"]

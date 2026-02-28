@@ -17,7 +17,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: optimizer
+      args:
+        SERVICE_DIR: optimizer
+        CMD_PATH: /usr/local/bin/optimizer
     ports:
       - "3001:3001"
 
@@ -39,9 +41,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: api
+      args:
+        SERVICE_DIR: api
+        CMD_PATH: /usr/local/bin/api
     ports:
-      - "3000:3000"
+      - "4000:4000"
     environment:
       - OPTIMIZER_URL=http://optimizer:3001
       - REDIS_URL=redis://redis:6379
