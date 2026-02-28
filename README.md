@@ -18,6 +18,8 @@
 | [📄 DISTRIBUTED.md](./DISTRIBUTED.md) | CAP theorem, load balancing, DLQ, consistent hashing, CQRS, event sourcing |
 | [📄 LINUX.md](./LINUX.md) | epoll, io_uring, sendfile/zero-copy, mmap, cache CPU, NUMA, Docker FROM scratch |
 | [📄 CACHE-CONTROL.md](./CACHE-CONTROL.md) | Cache-Control, directives, ETag, Last-Modified, Vary, stratégie par endpoint, net/http |
+| [📄 GOROUTINES.md](./GOROUTINES.md) | Goroutines, sémaphore, WaitGroup lock-free, io.Pipe, sync.Pool, sync.Map, atomic, GOMAXPROCS |
+| [📄 MINIO.md](./MINIO.md) | Stockage objet, PutObject/GetObject, stratégie de clés, intégration pipeline, Docker Compose |
 
 ---
 
